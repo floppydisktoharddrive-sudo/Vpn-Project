@@ -1,0 +1,16 @@
+{
+  "apps": [
+    "Bionic.exe",
+    "CalculatorApp.exe",
+    "chrome.exe",
+    "cmd.exe",
+    "python.exe",
+    "TextInputHost.exe",
+    "Microsoft.Media.Player.exe",
+    "notepad++.exe",
+    "msedge.exe",
+    "powershell.exe",
+    "fsquirt.exe",
+    "notepad.exe"
+  ]
+}

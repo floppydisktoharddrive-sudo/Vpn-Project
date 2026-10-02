@@ -1,0 +1,11 @@
+NetLock AES-256-GCM host-only tunnel
+Private bind (192.x LAN): 192.168.49.72
+Private TCP port: 51821
+Public bind: 0.0.0.0
+Public TCP port: 51822
+Private SOCKS5: 127.0.0.1:1080
+Public SOCKS5: 127.0.0.1:1081
+DNS list: 192.168.49.1
+Key file: C:\Users\user\Desktop\vpn blocker\vpn_data\aes256.key
+Cipher: AES-256-GCM
+No WireGuard. Key is 32 random bytes generated on this PC.

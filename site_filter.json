@@ -1,0 +1,154 @@
+{
+  "sites": [
+    {
+      "host": "www.facebook.com",
+      "blocked": false
+    },
+    {
+      "host": "facebook.com",
+      "blocked": false
+    },
+    {
+      "host": "www.twitter.com",
+      "blocked": false
+    },
+    {
+      "host": "twitter.com",
+      "blocked": false
+    },
+    {
+      "host": "www.x.com",
+      "blocked": false
+    },
+    {
+      "host": "x.com",
+      "blocked": false
+    },
+    {
+      "host": "www.instagram.com",
+      "blocked": false
+    },
+    {
+      "host": "instagram.com",
+      "blocked": false
+    },
+    {
+      "host": "www.tiktok.com",
+      "blocked": false
+    },
+    {
+      "host": "tiktok.com",
+      "blocked": false
+    },
+    {
+      "host": "www.reddit.com",
+      "blocked": false
+    },
+    {
+      "host": "reddit.com",
+      "blocked": false
+    },
+    {
+      "host": "www.youtube.com",
+      "blocked": false
+    },
+    {
+      "host": "youtube.com",
+      "blocked": false
+    },
+    {
+      "host": "drive.google.com",
+      "blocked": false
+    },
+    {
+      "host": "grok.com",
+      "blocked": false
+    },
+    {
+      "host": "speedtest.net",
+      "blocked": false
+    },
+    {
+      "host": "chrome:",
+      "blocked": false
+    },
+    {
+      "host": "download.torproject.org",
+      "blocked": true
+    },
+    {
+      "host": "newgrounds.com",
+      "blocked": false
+    },
+    {
+      "host": "uploads.ungrounded.net",
+      "blocked": false
+    },
+    {
+      "host": "mail.google.com",
+      "blocked": false
+    },
+    {
+      "host": "www.primevideo.com",
+      "blocked": false
+    },
+    {
+      "host": "primevideo.com",
+      "blocked": false
+    },
+    {
+      "host": "outlook.com",
+      "blocked": false
+    },
+    {
+      "host": "outlook.live.com",
+      "blocked": false
+    },
+    {
+      "host": "login.microsoft.com",
+      "blocked": false
+    },
+    {
+      "host": "account.live.com",
+      "blocked": false
+    },
+    {
+      "host": "login.microsoftonline.com",
+      "blocked": false
+    },
+    {
+      "host": "login.live.com",
+      "blocked": false
+    },
+    {
+      "host": "fast.com",
+      "blocked": false
+    },
+    {
+      "host": "www.perplexity.ai",
+      "blocked": false
+    },
+    {
+      "host": "perplexity.ai",
+      "blocked": false
+    }
+  ],
+  "ip_blacklist": [
+    "104.18.28.234",
+    "142.251.154.119",
+    "142.251.214.46",
+    "74.125.137.188",
+    "142.250.141.84",
+    "142.250.141.188",
+    "142.251.154.4",
+    "142.251.121.132",
+    "172.253.155.94",
+    "63.80.2.14",
+    "205.196.6.133",
+    "20.59.87.225"
+  ],
+  "protected_dns": [
+    "192.168.49.1",
+    "8.8.8.8"
+  ]
+}

@@ -1,0 +1,165 @@
+{
+  "updated_at": "2026-10-02T07:04:11Z",
+  "firewall_mode": "vpn",
+  "tunnel_port": 51821,
+  "socks_port": 1080,
+  "tunnel_dns": [
+    "192.168.49.1"
+  ],
+  "bind": "192.168.49.72",
+  "vpn_running": true,
+  "key_file": "vpn_data/aes256.key",
+  "sites_blocked": false,
+  "http_guard": true,
+  "shield_http_https": false,
+  "local_ip": "192.168.49.72",
+  "gateway": "192.168.49.1",
+  "adapter": "Wi-Fi",
+  "connection_kind": "modem_router_wifi",
+  "wintun_driver": "Wintun kernel driver ready; adapter NetLockTUN created from C:\\Users\\user\\Desktop\\vpn blocker\\bin\\amd64\\wintun.dll",
+  "app_proxies": [
+    {
+      "pid": "15748",
+      "app": "CalculatorApp.exe",
+      "proxy": "127.0.0.1:18348"
+    },
+    {
+      "pid": "2328",
+      "app": "chrome.exe",
+      "proxy": "127.0.0.1:8080"
+    },
+    {
+      "pid": "15532",
+      "app": "cmd.exe",
+      "proxy": "127.0.0.1:18132"
+    },
+    {
+      "pid": "12204",
+      "app": "Microsoft.Media.Player.exe",
+      "proxy": "127.0.0.1:18304"
+    },
+    {
+      "pid": "6344",
+      "app": "notepad++.exe",
+      "proxy": "127.0.0.1:18444"
+    },
+    {
+      "pid": "2736",
+      "app": "python.exe",
+      "proxy": "127.0.0.1:18336"
+    },
+    {
+      "pid": "16680",
+      "app": "TextInputHost.exe",
+      "proxy": "127.0.0.1:18280"
+    }
+  ],
+  "c_net": {
+    "ok": true,
+    "ip": "192.168.49.72",
+    "port": 8000,
+    "dns": [],
+    "gateway": "192.168.49.1",
+    "source": "netlock_net 1.0",
+    "bound": true,
+    "connected": false,
+    "ifaces": [
+      {
+        "name": "Ethernet",
+        "ip": "169.254.200.17",
+        "netmask": "",
+        "is_192": false,
+        "is_loopback": false
+      },
+      {
+        "name": "NetLockTUN",
+        "ip": "169.254.110.21",
+        "netmask": "",
+        "is_192": false,
+        "is_loopback": false
+      },
+      {
+        "name": "PdaNet Broadband Connection",
+        "ip": "10.1.19.2",
+        "netmask": "",
+        "is_192": false,
+        "is_loopback": false
+      },
+      {
+        "name": "Local Area Connection* 9",
+        "ip": "169.254.45.22",
+        "netmask": "",
+        "is_192": false,
+        "is_loopback": false
+      },
+      {
+        "name": "Local Area Connection* 11",
+        "ip": "169.254.137.168",
+        "netmask": "",
+        "is_192": false,
+        "is_loopback": false
+      },
+      {
+        "name": "Wi-Fi",
+        "ip": "192.168.49.72",
+        "netmask": "",
+        "is_192": true,
+        "is_loopback": false
+      },
+      {
+        "name": "Bluetooth Network Connection",
+        "ip": "169.254.251.128",
+        "netmask": "",
+        "is_192": false,
+        "is_loopback": false
+      },
+      {
+        "name": "Loopback Pseudo-Interface 1",
+        "ip": "127.0.0.1",
+        "netmask": "",
+        "is_192": false,
+        "is_loopback": true
+      }
+    ]
+  },
+  "broadband_port": 8000,
+  "last_engine_hit": "blocked-ip: 142.251.214.46:443 pid=2736",
+  "session_key_rotated": true,
+  "session_key": "C:\\Users\\user\\Desktop\\vpn blocker\\vpn_data\\session.key",
+  "firewall_detected": {
+    "domain": {
+      "logging": ""
+    },
+    "private": {
+      "logging": ""
+    },
+    "public": {
+      "logging": ""
+    }
+  },
+  "protected_dns": [
+    "192.168.49.1",
+    "8.8.8.8"
+  ],
+  "dhcp_dns": [
+    "192.168.49.1"
+  ],
+  "dhcp_ip": "192.168.49.72",
+  "dhcp_gateway": "192.168.49.1",
+  "dhcp_adapter": "Wi-Fi",
+  "dhcp_enabled": true,
+  "dhcp_lease_server": "10.1.19.1",
+  "http_proxy": "127.0.0.1:8080",
+  "vpn_monitors_only": true,
+  "auto_bind": true,
+  "firewall_profiles": [
+    "domain",
+    "private",
+    "public"
+  ],
+  "vpn_scope": "private",
+  "vpn_public_running": true,
+  "vpn_scope_public": "public",
+  "site_filter": true,
+  "http_https_vpn": true
+}

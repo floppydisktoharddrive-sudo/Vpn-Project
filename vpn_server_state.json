@@ -1,0 +1,17 @@
+{
+  "port": 51821,
+  "public_port": 51822,
+  "socks_port": 1080,
+  "public_socks_port": 1081,
+  "dns": [
+    "192.168.49.1"
+  ],
+  "bind": "192.168.49.72",
+  "public_bind": "0.0.0.0",
+  "running": true,
+  "public_running": true,
+  "key_file": "vpn_data/aes256.key",
+  "server_conf": "vpn_data/server.txt",
+  "client_conf": "vpn_data/server.txt",
+  "c_helper_dll": "libnetlock_net.dll"
+}

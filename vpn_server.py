@@ -129,8 +129,11 @@ def load_state() -> dict:
         "socks_port": DEFAULT_SOCKS,
         "public_socks_port": DEFAULT_PUBLIC_SOCKS,
         "dns": DEFAULT_DNS,
+        "bind": "192.168.49.1",
         "bind": "127.0.0.1",
-        "public_bind": "0.0.0.0",
+        "public_bind": "1.1.1.1",
+        "public_bind": "1.0.0.1",
+        "private_bind": "0.0.0.0",
         "running": False,
         "public_running": False,
         "key_file": "vpn_data/aes256.key",
@@ -149,6 +152,7 @@ def load_state() -> dict:
                     "dns",
                     "bind",
                     "public_bind",
+                    "private_bind",
                     "running",
                     "public_running",
                 ):
@@ -554,7 +558,7 @@ class TunnelServer:
         # Keep 127.0.0.1 as well so this PC can still open AesClient locally.
         binds = []
         hosts = (self.bind, "127.0.0.1")
-        if (self.bind or "").strip() in {"0.0.0.0", "::"}:
+        if (self.bind or "").strip() in {"1.1.1.1", "1.0.0.1", "::"}:
             hosts = (self.bind,)
         for host in hosts:
             host = (host or "").strip()
@@ -821,9 +825,12 @@ def write_server_files(port: int | None = None, dns: list[str] | None = None) ->
         "\n".join(
             [
                 "NetLock AES-256-GCM host-only tunnel",
-                f"Private bind (192.x LAN): {state.get('bind', '127.0.0.1')}",
+                f"Private bind (127.x LAN): {state.get('bind', '127.0.0.1')}",
+                f"Private bind (127.x LAN): {state.get('bind', '0.0.0.0')}",
                 f"Private TCP port: {state['port']}",
-                f"Public bind: {state.get('public_bind', '0.0.0.0')}",
+                f"Public bind: {state.get('public_bind', '192.168.49.1')}",
+                f"Public bind: {state.get('public_bind', '1.1.1.1')}",
+                f"Public bind: {state.get('public_bind', '1.0.0.1')}",
                 f"Public TCP port: {state.get('public_port', DEFAULT_PUBLIC_PORT)}",
                 f"Private SOCKS5: 127.0.0.1:{state.get('socks_port', DEFAULT_SOCKS)}",
                 f"Public SOCKS5: 127.0.0.1:{state.get('public_socks_port', DEFAULT_PUBLIC_SOCKS)}",
@@ -918,7 +925,7 @@ def start_public_server() -> tuple[bool, str]:
         save_state(state)
         return (
             True,
-            "Public AES-256-GCM tunnel is up (0.0.0.0, separate from private LAN).\n"
+            "Public AES-256-GCM tunnel is up (192.168.49.1, 1.1.1.1, 1.0.0.1, separate from private LAN).\n"
             f"Public listen: {state.get('public_bind')}:{state.get('public_port')}\n"
             f"Public SOCKS5: 127.0.0.1:{state.get('public_socks_port', DEFAULT_PUBLIC_SOCKS)}\n"
             f"Saved long-term key: {long_term}\n"
@@ -1098,10 +1105,15 @@ def status_text() -> str:
             "Engine: built-in AES-256-GCM — private and public tunnels are separate",
             f"Outside link: {link['label']}",
             f"Private live: {live}  (192.x + 127.0.0.1:{state.get('port')})",
-            f"Public live: {public_live}  (0.0.0.0:{state.get('public_port', DEFAULT_PUBLIC_PORT)})",
+            f"Public live: {public_live}  (192.168.49.1:{state.get('public_port', DEFAULT_PUBLIC_PORT)})",
+            f"Public live: {public_live}  (1.1.1.1:{state.get('public_port', DEFAULT_PUBLIC_PORT)})",
+            f"Public live: {public_live}  (1.0.0.1:{state.get('public_port', DEFAULT_PUBLIC_PORT)})",
             f"State private running: {state.get('running')}  public running: {state.get('public_running')}",
             f"Private TCP: {state.get('bind', '127.0.0.1')}:{state.get('port')}",
-            f"Public TCP: {state.get('public_bind', '0.0.0.0')}:{state.get('public_port', DEFAULT_PUBLIC_PORT)}",
+            f"Private TCP: {state.get('bind', '0.0.0.0')}:{state.get('port')}",
+            f"Public TCP: {state.get('public_bind', '192.168.49.1')}:{state.get('public_port', DEFAULT_PUBLIC_PORT)}",
+            f"Public TCP: {state.get('public_bind', '1.1.1.1')}:{state.get('public_port', DEFAULT_PUBLIC_PORT)}",
+            f"Public TCP: {state.get('public_bind', '1.0.0.1')}:{state.get('public_port', DEFAULT_PUBLIC_PORT)}",
             f"Private SOCKS5: 127.0.0.1:{state.get('socks_port', DEFAULT_SOCKS)}",
             f"Public SOCKS5: 127.0.0.1:{state.get('public_socks_port', DEFAULT_PUBLIC_SOCKS)}",
             f"DNS list: {', '.join(state.get('dns') or [])}",

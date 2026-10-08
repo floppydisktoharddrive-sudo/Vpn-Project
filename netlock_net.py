@@ -271,3 +271,8 @@ if __name__ == "__main__":
         for row in list_ifaces():
             print(" ", row)
         print("attach:", attach_existing_broadband())
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

@@ -1,9 +1,4 @@
 # NetLock
-# FREE TO USE LICENCE OPEN SOURCE CODE.
-# THE FINAL VERSION WILL BE .EXE TO BE PURCHASED FOR $1.00 
-# IF YOU CAN DONATE IT WILL BE GREATLY APPRECIATED.
-# LINKS FOR DONATION:
-#
 
 Windows host toolkit: site blocker, firewall modes, AES-256-GCM tunnel.
 
@@ -59,7 +54,7 @@ python vpn_server.py generate|start|stop|status
 
 ## Boot reset
 
-`start.bat` first resets proxy/DNS to default, prints local IPv4 + gateway, and probes the Internet. If the probe fails it renews DHCP and resets the TCP/IP catalog, then the GUI starts the VPN+SQL HTTP/HTTPS shield bound to those LAN addresses.
+`start.bat` probes the Internet first. If it is already up, adapter and Winsock reset are skipped. If it is offline, `soft_reset.bat` resets Winsock and the TCP/IP catalog, bounces the active adapter, and renews DHCP. That path does not restart Windows; the desktop stays logged in. The 0.0.0.0 wildcard guard then starts hidden (`secure_server.py`) and the GUI opens as before.
 
 ## Launch posture
 

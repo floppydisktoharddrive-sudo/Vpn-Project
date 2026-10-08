@@ -119,10 +119,59 @@ def all_process_names() -> list[str]:
     return [p["app"] for p in desktop_processes()]
 
 
+SCRIPT_SUFFIXES = (".py", ".pyw", ".ps1", ".bat", ".cmd", ".js", ".vbs", ".wsf")
+SCRIPT_HOSTS = {
+    "python.exe", "pythonw.exe", "py.exe", "powershell.exe", "pwsh.exe",
+    "cmd.exe", "wscript.exe", "cscript.exe", "node.exe", "java.exe", "javaw.exe",
+}
+
+
+def running_scripts() -> list[dict]:
+    """Scripts currently launched by an interpreter. Names only; nothing is executed."""
+    found: list[dict] = []
+    if os.name != "nt":
+        return found
+    cmd = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.CommandLine } | "
+        "Select-Object ProcessId, Name, CommandLine | ConvertTo-Json -Compress"
+    )
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            capture_output=True, text=True, timeout=25,
+        )
+        raw = (res.stdout or "").strip()
+        if not raw:
+            return found
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+    except Exception:
+        return found
+    for item in data or []:
+        host = str(item.get("Name") or "")
+        if host.lower() not in SCRIPT_HOSTS:
+            continue
+        line = str(item.get("CommandLine") or "")
+        script = ""
+        for part in line.replace("'", '"').split('"'):
+            low = part.strip().lower()
+            if low.endswith(SCRIPT_SUFFIXES):
+                script = Path(part.strip()).name
+                break
+        if not script:
+            continue
+        found.append({"pid": str(item.get("ProcessId") or ""), "app": script, "host": host})
+    return found
+
+
 def sync_open_apps() -> list[str]:
-    """Desktop-window apps stay on the do-not-kill list."""
+    """Desktop apps and running scripts stay on the protected list."""
     current = load_protected()
     found = [p["app"] for p in desktop_processes()]
+    found.extend(row["app"] for row in running_scripts())
+    found.extend(row["host"] for row in running_scripts())
     return save_protected(current + found)
 
 
@@ -140,3 +189,9 @@ def is_protected_app(name: str) -> bool:
         if name == item_l or name.startswith(item_l.removesuffix(".exe")) or item_l in name:
             return True
     return False
+
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

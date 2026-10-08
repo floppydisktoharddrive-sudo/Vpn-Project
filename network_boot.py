@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+import time
+from pathlib import Path
 import re
 import socket
 import subprocess
@@ -156,9 +158,23 @@ def probe_from(local_ip: str, timeout: float = 3.0) -> tuple[bool, str, int]:
     return False, "", last_port
 
 
+def _drop_fec(items) -> list[str]:
+    """Windows invents fec0:0:0:ffff::* when no DNS is set. Never keep those."""
+    out, seen = [], set()
+    for raw in items or []:
+        item = str(raw).strip()
+        low = item.lower()
+        if not item or low in {"0.0.0.0", "::", "::1"} or low.startswith("fec0:"):
+            continue
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 def auto_dns(row: dict) -> list[str]:
     """Modem/router: use NIC DNS or the 192.x gateway. PdaNet: keep whatever is already working."""
-    dns = [d for d in (row.get("dns") or []) if d and not _is_10(d) and d not in {"0.0.0.0"}]
+    dns = _drop_fec(d for d in (row.get("dns") or []) if d and not _is_10(d) and d not in {"0.0.0.0"})
     gw = row.get("gateway") or ""
     kind = classify_adapter(row.get("adapter") or "", row.get("local_ip") or "", gw)
     if kind.startswith("modem_router"):
@@ -235,7 +251,7 @@ def _parse_rows(raw: str) -> list[dict]:
         elif k == "ADAPTER":
             cur["adapter"] = v
         elif k == "DNS":
-            cur["dns"] = [p.strip() for p in v.split(",") if p.strip()]
+            cur["dns"] = _drop_fec(p.strip() for p in v.split(",") if p.strip())
         elif k == "UP":
             cur["up"] = v.lower() in {"true", "up", "1", "yes"}
     if cur.get("local_ip"):
@@ -453,9 +469,14 @@ def reset_to_default(log: Callable[[str], None] | None = None) -> list[str]:
 
     say("Resetting NIC DNS to DHCP/automatic...")
     _ps(
-        "Get-DnsClient | ForEach-Object { "
-        "Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex -ResetServerAddresses "
-        "-ErrorAction SilentlyContinue }"
+        "$adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue); "
+        "foreach ($a in $adapters) { "
+        "Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue; "
+        "netsh interface ipv4 set dnsservers name=\"$($a.Name)\" source=dhcp | Out-Null; "
+        "netsh interface ipv6 set dnsservers name=\"$($a.Name)\" source=dhcp | Out-Null "
+        "}; "
+        "Get-DnsClient -ErrorAction SilentlyContinue | ForEach-Object { "
+        "Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex -ResetServerAddresses -ErrorAction SilentlyContinue }"
     )
 
     say("Flushing DNS cache...")
@@ -464,18 +485,7 @@ def reset_to_default(log: Callable[[str], None] | None = None) -> list[str]:
     say("Clearing ARP cache...")
     _run(["netsh", "interface", "ip", "delete", "arpcache"])
 
-    say("Default connection profile restored (inbound block / outbound allow).")
-    for profile in ("domain", "private", "public"):
-        _run(
-            [
-                "netsh",
-                "advfirewall",
-                "set",
-                profile + "profile",
-                "firewallpolicy",
-                "blockinbound,allowoutbound",
-            ]
-        )
+    say("Proxy and DNS restored. Port lock/block is not applied.")
     return notes
 
 
@@ -501,15 +511,35 @@ def repair_if_offline(log: Callable[[str], None] | None = None) -> list[str]:
     say(f"  Adapter    : {info.get('adapter') or '(unknown)'}")
     say(f"  NIC DNS    : {', '.join(info.get('dns') or []) or '(dhcp)'}")
 
-    say("Releasing and renewing DHCP leases...")
-    _run(["ipconfig", "/release"], timeout=60)
-    _run(["ipconfig", "/renew"], timeout=90)
-
-    say("Resetting TCP/IP stack catalog (no reboot forced)...")
-    _run(["netsh", "int", "ip", "reset"], timeout=60)
-
-    say("Flushing DNS again...")
-    _run(["ipconfig", "/flushdns"])
+    adapter = info.get("adapter") or ""
+    flag = Path(__file__).resolve().parent / "vpn_data" / "need_soft_reset.flag"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(adapter, encoding="utf-8")
+    say("Offline only — soft adapter + Winsock reset. Desktop stays logged in. No reboot.")
+    bat = Path(__file__).resolve().parent / "soft_reset.bat"
+    if bat.exists():
+        say(f"Running {bat.name} for '{adapter or 'all adapters'}'...")
+        _run(["cmd", "/c", str(bat), adapter], timeout=120)
+        try:
+            flag.unlink()
+        except OSError:
+            pass
+    else:
+        say("soft_reset.bat missing — running the same steps inline.")
+        _run(["netsh", "winsock", "reset"], timeout=60)
+        _run(["netsh", "int", "ip", "reset"], timeout=60)
+        _run(["netsh", "winhttp", "reset", "proxy"])
+        _run(["ipconfig", "/flushdns"])
+        _run(["netsh", "interface", "ip", "delete", "arpcache"])
+        if adapter:
+            say(f"Bouncing adapter '{adapter}' (disable/enable, session stays up)...")
+            _run(["netsh", "interface", "set", "interface", f"name={adapter}", "admin=disabled"], timeout=30)
+            _run(["netsh", "interface", "set", "interface", f"name={adapter}", "admin=enabled"], timeout=30)
+        _run(["ipconfig", "/release"], timeout=60)
+        _run(["ipconfig", "/renew"], timeout=90)
+        _run(["net", "stop", "dnscache"], timeout=30)
+        _run(["net", "start", "dnscache"], timeout=30)
+    say("Soft reset finished. Windows may print a reboot hint; this process does not restart the PC.")
     return notes
 
 
@@ -559,15 +589,23 @@ def boot_network() -> dict:
             "broadband_target": info.get("broadband_target"),
             "broadband_port": info.get("broadband_port"),
             "tunnel_dns": info.get("dns") or ["1.1.1.1", "1.0.0.1"],
+            "wildcard": False,
+            "wildcard_online": bool(ok),
         }
     )
     try:
         import dhcp_bind
 
         bound = dhcp_bind.auto_bind_and_save()
-        print(f"DHCP bind  : {bound.get('dhcp_ip') or '(none)'} dns={', '.join(bound.get('dhcp_dns') or [])}")
+        print(
+            f"DHCP bind  : {bound.get('dhcp_ip') or '(none)'} "
+            f"dns={', '.join(bound.get('dhcp_dns') or [])} "
+            f"gateway_dns={'ok' if bound.get('dhcp_dns_verified') else 'fail'} "
+            f"binding={'ok' if bound.get('dhcp_binding_ok') else 'fail'}"
+        )
         print(f"Protected DNS: {', '.join(bound.get('protected_dns') or [])}")
-        print(dhcp_bind.apply_http_https_vpn(int(persist.load_applied().get("tunnel_port") or 51821)))
+        print("VPN off. DHCP bind left on the selected mode.")
+        persist.write_applied_and_save({"firewall_mode": "off", "port_lock": False})
     except Exception as exc:
         print(f"DHCP bind  : skipped ({exc})")
     try:
@@ -578,8 +616,110 @@ def boot_network() -> dict:
         info["c_net"] = attached
     except Exception as exc:
         print(f"C helper   : skipped ({exc})")
+    persist.write_applied_and_save({
+        "wildcard": False,
+        "wildcard_configured": False,
+        "wildcard_online": bool(ok),
+    })
+    print("Wildcard   : False address=0.0.0.0 (off until the GUI turns it on)")
+    info["wildcard"] = False
     print("=== reset complete ===")
     return {"ok": ok, "detail": detail, **info}
+
+
+def restore_original_and_wait() -> bool:
+    """Drop NetLock config, restore DHCP and firewall, block 1.0.0.0, wait until online."""
+    print("Closing: removing NetLock configuration...")
+    try:
+        import vpn_server
+        print(vpn_server.stop_server()[1])
+    except Exception as exc:
+        print(f"VPN stop skipped: {exc}")
+    try:
+        import guard
+        print(guard.stop()[1])
+    except Exception as exc:
+        print(f"Guard stop skipped: {exc}")
+    try:
+        import app_proxy
+        print(app_proxy.stop())
+    except Exception as exc:
+        print(f"Proxy stop skipped: {exc}")
+    try:
+        import parallel_processor
+        parallel_processor.stop()
+        print("Parallel binds closed.")
+    except Exception as exc:
+        print(f"Parallel stop skipped: {exc}")
+    try:
+        import dns_force
+        print(dns_force.stop())
+    except Exception as exc:
+        print(f"DNS force stop skipped: {exc}")
+    try:
+        import wintun_tun
+        print(wintun_tun.stop())
+    except Exception as exc:
+        print(f"Wintun stop skipped: {exc}")
+    try:
+        import blocker
+        blocker.apply_unblock(blocker.hosts_path())
+        data = blocker.load_filter()
+        data["protected_dns"] = [x for x in data.get("protected_dns") or [] if x != "1.0.0.0"]
+        blocker.add_ip("1.0.0.0")
+        blocker.save_filter(data)
+        print("Hosts configuration removed. 1.0.0.0 disabled and guarded.")
+    except Exception as exc:
+        print(f"Blocker cleanup skipped: {exc}")
+    try:
+        import netlock
+        state = netlock.load_state()
+        netlock.delete_netlock_rules()
+        if os.name == "nt":
+            for profile in ("domain", "private", "public"):
+                _run(["netsh", "advfirewall", "set", profile + "profile", "state", "on"])
+                _run(["netsh", "advfirewall", "set", profile + "profile", "firewallpolicy", "blockinbound,allowoutbound"])
+            _run([
+                "netsh", "advfirewall", "firewall", "add", "rule",
+                "name=NetLock - guard 1.0.0.0", "dir=in", "action=block",
+                "remoteip=1.0.0.0", "enable=yes",
+            ])
+            _run([
+                "netsh", "advfirewall", "firewall", "add", "rule",
+                "name=NetLock - guard 1.0.0.0 out", "dir=out", "action=block",
+                "remoteip=1.0.0.0", "enable=yes",
+            ])
+        state["mode"] = "off"
+        netlock.save_state(state)
+        print("Firewall restored to original inbound-block / outbound-allow.")
+    except Exception as exc:
+        print(f"Firewall restore skipped: {exc}")
+    reset_to_default()
+    if os.name == "nt":
+        print("Renewing DHCP...")
+        _run(["ipconfig", "/renew"], timeout=60)
+    try:
+        import persist
+        persist.write_applied_and_save({
+            "firewall_mode": "off",
+            "vpn_running": False,
+            "vpn_public_running": False,
+            "http_guard": False,
+            "wildcard": False,
+            "protected_dns": [],
+        })
+    except Exception:
+        pass
+    print("Waiting until the connection is live...")
+    for _ in range(12):
+        ok, detail = probe_internet(timeout=3.0)
+        print(detail)
+        if ok:
+            print("Connection is live.")
+            return True
+        time.sleep(2)
+    print("Connection was not confirmed live.")
+    return False
 
 
 def lan_safe_ips() -> set[str]:
@@ -607,3 +747,8 @@ def lan_safe_ips() -> set[str]:
 if __name__ == "__main__":
     boot_network()
     raise SystemExit(0)
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

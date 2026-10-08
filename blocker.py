@@ -347,3 +347,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

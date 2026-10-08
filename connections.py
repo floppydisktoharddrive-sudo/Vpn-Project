@@ -143,3 +143,8 @@ def as_text(rows: list[dict] | None = None) -> str:
         )
     lines.append(f"\nTotal: {len(rows)}")
     return "\n".join(lines)
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

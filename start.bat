@@ -71,11 +71,24 @@ if exist "%~dp0libnetlock_net.dll" (
 echo.
 echo Binding to the working Internet connection, then starting the GUI...
 "%PYEXE%" "%~dp0network_boot.py"
+if exist "%~dp0vpn_data\need_soft_reset.flag" (
+    set /p ADAPTER=<"%~dp0vpn_data\need_soft_reset.flag"
+    echo Internet was offline — soft adapter and Winsock reset, no reboot...
+    call "%~dp0soft_reset.bat" "%ADAPTER%"
+    del "%~dp0vpn_data\need_soft_reset.flag" >nul 2>&1
+)
+echo Binding and configuring servers ^(secure, stream, parallel, vpn, proxy^)...
+"%PYEXE%" "%~dp0bind_servers.py"
+echo Wildcard is true only when that bind reports configured and online.
 echo.
 
 "%PYEXE%" "%~dp0app_gui.py"
+echo.
+echo Checking the connection is live before this window closes...
+"%PYEXE%" -c "import network_boot; raise SystemExit(0 if network_boot.probe_internet()[0] else 1)"
 if errorlevel 1 (
-    echo.
-    echo GUI exited with an error.
-    pause
+    echo Connection is not live yet. Restoring DHCP and firewall...
+    "%PYEXE%" -c "import network_boot; network_boot.restore_original_and_wait()"
 )
+echo Connection check finished.
+pause

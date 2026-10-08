@@ -70,8 +70,8 @@ def snapshot(limit: int = 80) -> dict:
     now = time.time()
     with _lock:
         _trim_windows(now)
-        up_bps = _bps(_win_up)
-        down_bps = _bps(_win_down)
+        up_bps = max(_bps(_win_up), _nic_up_bps)
+        down_bps = max(_bps(_win_down), _nic_down_bps)
         return {
             "lines": list(_lines[-limit:]),
             "bytes_up": _bytes_up,
@@ -115,8 +115,6 @@ def poll_nic() -> tuple[float, float]:
                 dt = max(now - _nic_prev_t, 0.2)
                 _nic_up_bps = max(0.0, (sent - _nic_prev[0]) / dt)
                 _nic_down_bps = max(0.0, (recv - _nic_prev[1]) / dt)
-                traffic("up", max(0, sent - _nic_prev[0]), "nic")
-                traffic("down", max(0, recv - _nic_prev[1]), "nic")
             _nic_prev = (sent, recv)
             _nic_prev_t = now
         except Exception:
@@ -162,8 +160,6 @@ def poll_nic() -> tuple[float, float]:
             dt = max(now - _nic_prev_t, 0.2)
             _nic_up_bps = max(0.0, (sent - _nic_prev[0]) / dt)
             _nic_down_bps = max(0.0, (recv - _nic_prev[1]) / dt)
-            traffic("up", max(0, sent - _nic_prev[0]), "nic")
-            traffic("down", max(0, recv - _nic_prev[1]), "nic")
         _nic_prev = (sent, recv)
         _nic_prev_t = now
     except Exception:
@@ -175,3 +171,8 @@ def text(limit: int = 80) -> str:
     snap = snapshot(limit)
     head = f"UP {snap['bytes_up']}  DOWN {snap['bytes_down']}"
     return head + "\n" + "\n".join(snap["lines"])
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

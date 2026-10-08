@@ -93,3 +93,8 @@ def write_applied_and_save(updates: dict | None = None) -> dict:
     SAVE_FILE.write_text(payload, encoding="utf-8")
     SAVE_TEXT.write_text(_text(rec), encoding="utf-8")
     return rec
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

@@ -135,3 +135,8 @@ def client_ssl_context() -> ssl.SSLContext:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

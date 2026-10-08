@@ -283,15 +283,11 @@ def scan_and_act(kill: bool = False, tunnel_port: int = 51821) -> list[dict]:
         row["tag"] = tag
         if tag != "ok":
             flagged.append(row)
-            if kill and tag in {
-                "blocked-host",
-                "blocked-ip",
-                "sql-inbound",
-                "vpn-inbound",
-                "sql-outbound",
-                "third-party-in",
-                "piggyback",
-            }:
+            if tag in {"sql-inbound", "vpn-inbound", "sql-outbound", "third-party-in", "piggyback"}:
+                engine.note_hit(tag, f"{row.get('remote')} pid={row.get('pid')}")
+                row["action"] = "observe-only; port lock removed"
+                continue
+            if kill and tag in {"blocked-host", "blocked-ip"}:
                 engine.note_hit(tag, f"{row.get('remote')} pid={row.get('pid')}")
                 ok, msg = terminate_pid(row.get("pid") or "")
                 row["action"] = msg if ok else f"not killed: {msg}"
@@ -343,20 +339,36 @@ def _split_host_port(host: str, default_port: int) -> tuple[str, int]:
     return host, default_port
 
 
+def _seal_http(data: bytes, kind: str) -> bytes:
+    """Endpoint already has the bytes. Do not seal/open 4KB slices or log each chunk."""
+    return data
+
+
 def _pipe_aes(client: socket.socket, link) -> None:
     def to_net():
+        import data_stream
+        up_pending = bytearray()
         try:
             while True:
                 data = client.recv(262144)
                 if not data:
                     break
+                hit = engine.inspect_payload(data)
+                if hit:
+                    engine.note_hit(hit, "https-up")
+                    break
+                data = _seal_http(data, "https-up")
                 try:
                     import stream
 
                     stream.traffic("up", len(data), "aes")
                 except Exception:
                     pass
-                link.send(data)
+                import data_stream
+                data_stream.send_small(client, link, data, up_pending)
+            rest = data_stream.drain_small(up_pending)
+            if rest:
+                link.send(rest)
         except OSError:
             pass
         try:
@@ -365,18 +377,29 @@ def _pipe_aes(client: socket.socket, link) -> None:
             pass
 
     def to_app():
+        import data_stream
+        down_pending = bytearray()
         try:
             while True:
                 data = link.recv()
                 if not data:
                     break
+                hit = engine.inspect_payload(data)
+                if hit:
+                    engine.note_hit(hit, "https-down")
+                    break
+                data = _seal_http(data, "https-down")
                 try:
                     import stream
 
                     stream.traffic("down", len(data), "aes")
                 except Exception:
                     pass
-                client.sendall(data)
+                import data_stream
+                data_stream.send_small(link, client, data, down_pending)
+            rest = data_stream.drain_small(down_pending)
+            if rest:
+                client.sendall(rest)
         except OSError:
             pass
         try:
@@ -387,7 +410,7 @@ def _pipe_aes(client: socket.socket, link) -> None:
     t = threading.Thread(target=to_app, daemon=True)
     t.start()
     to_net()
-    t.join(timeout=2)
+    t.join()
 
 
 def _mitm_https(client: socket.socket, dest: str, port: int) -> None:
@@ -411,14 +434,14 @@ def _mitm_https(client: socket.socket, dest: str, port: int) -> None:
                     if hit:
                         engine.note_hit(hit, dest)
                         break
-                    dst.sendall(data)
+                    dst.sendall(_seal_http(data, "https"))
             except OSError:
                 pass
 
         t = threading.Thread(target=inspect_and_send, args=(tls_remote, tls_client), daemon=True)
         t.start()
         inspect_and_send(tls_client, tls_remote)
-        t.join(timeout=2)
+        t.join()
     except Exception:
         try:
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -486,7 +509,7 @@ def _handle_http(client: socket.socket) -> None:
                 client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             else:
                 remote.sendall(b"".join(headers))
-            _pipe(client, remote)
+            _pipe(client, remote, dest)
             return
         if HTTP_THROUGH_VPN and vpn_server.is_tunnel_live():
             link = vpn_server.AesClient()
@@ -521,14 +544,18 @@ def _handle_http(client: socket.socket) -> None:
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             return
         if method == "CONNECT":
+            import data_stream
             if _passthrough_host(dest):
                 client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                _pipe(client, remote)
+                _pipe(client, remote, dest)
+            elif data_stream.upload_host(dest):
+                client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                _pipe(client, remote, dest)
             else:
                 _mitm_https(client, dest, int(port))
             return
         remote.sendall(b"".join(headers))
-        _pipe(client, remote)
+        _pipe(client, remote, dest)
     except Exception:
         pass
     finally:
@@ -539,20 +566,42 @@ def _handle_http(client: socket.socket) -> None:
             pass
 
 
-def _pipe(a: socket.socket, b: socket.socket) -> None:
+def _pipe(a: socket.socket, b: socket.socket, host: str = "") -> None:
+    upload = False
+    try:
+        import data_stream
+        upload = data_stream.upload_host(host)
+    except Exception:
+        upload = False
+
     def one(src, dst):
+        pending = bytearray()
+        uploading = upload and src is a
         try:
             while True:
                 data = src.recv(1024 * 1024)
                 if not data:
                     break
+                if uploading:
+                    import data_stream
+                    data_stream.send_upload_bytes(dst, data)
+                    continue
+                hit = engine.inspect_payload(data)
+                if hit:
+                    engine.note_hit(hit, "http")
+                    break
+                data = _seal_http(data, "http-down" if src is b else "http-up")
                 try:
                     import stream
 
                     stream.traffic("down" if src is b else "up", len(data), "tcp")
                 except Exception:
                     pass
-                dst.sendall(data)
+                import data_stream
+                data_stream.send_small(src, dst, data, pending)
+            rest = data_stream.drain_small(pending)
+            if rest:
+                dst.sendall(rest)
         except OSError:
             pass
         try:
@@ -715,3 +764,8 @@ def stop() -> tuple[bool, str]:
 
 def running() -> bool:
     return any(t.is_alive() for t in _threads)
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import os
 import sys
+import threading
 import traceback
 import tkinter as tk
 from contextlib import redirect_stdout, redirect_stderr
@@ -16,6 +17,9 @@ if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
 import app_proxy
+import parallel_processor
+import parallel_tab
+import secure_stream
 import apps
 import blocker
 import connections
@@ -103,16 +107,19 @@ class NetLockApp(tk.Tk):
         self.tab_sites_scroll = ScrollableFrame(nb)
         self.tab_fw_scroll = ScrollableFrame(nb)
         self.tab_vpn_scroll = ScrollableFrame(nb)
+        self.tab_parallel_scroll = ScrollableFrame(nb)
         self.tab_conn_scroll = ScrollableFrame(nb)
 
         self.tab_sites = self.tab_sites_scroll.scrollable_frame
         self.tab_fw = self.tab_fw_scroll.scrollable_frame
         self.tab_vpn = self.tab_vpn_scroll.scrollable_frame
+        self.tab_parallel = self.tab_parallel_scroll.scrollable_frame
         self.tab_conn = self.tab_conn_scroll.scrollable_frame
 
         nb.add(self.tab_sites_scroll, text="Site filter")
         nb.add(self.tab_fw_scroll, text="Firewall")
         nb.add(self.tab_vpn_scroll, text="VPN server")
+        nb.add(self.tab_parallel_scroll, text="Parallel processes")
         nb.add(self.tab_conn_scroll, text="All connections")
         self.nb = nb
         
@@ -139,13 +146,13 @@ class NetLockApp(tk.Tk):
         self._build_sites()
         self._build_firewall()
         self._build_vpn()
+        self._build_parallel()
         self._build_connections()
         nb.bind("<<NotebookTabChanged>>", self._on_tab)
 
         if not self.admin:
             self._log("Start with start.bat so Windows can elevate this GUI.")
 
-        self._refresh_all()
         self.after(200, self._boot_shield)
 
     def _log(self, text: str) -> None:
@@ -358,10 +365,19 @@ class NetLockApp(tk.Tk):
         self._log(f"Removed IP {ip}")
 
     def _scan_apps(self) -> None:
+        scripts = apps.running_scripts()
         names = apps.sync_open_apps()
-        persist.write_applied_and_save({"protected_apps": names})
+        persist.write_applied_and_save({"protected_apps": names, "protected_scripts": [row.get("app") for row in scripts]})
+        try:
+            parallel_processor.start()
+            for row in scripts:
+                parallel_processor.open_for_process(int(row.get("pid") or 0), 0, row.get("app") or "", "SCRIPT")
+            token = secure_stream.seal_wildcard(0, 0, "protected-scripts")
+            self._log(f"Script seal {token[:18]} generation={secure_stream.ring().generation}")
+        except Exception as exc:
+            self._log(f"Parallel script bind skipped: {exc}")
         self._reload_filter_ui()
-        self._log("Protected desktop apps:\n  " + "\n  ".join(names or ["(none)"]))
+        self._log("Protected apps and scripts:\n  " + "\n  ".join(names or ["(none)"]))
     def _build_firewall(self) -> None:
         ttk.Label(
             self.tab_fw,
@@ -397,7 +413,15 @@ class NetLockApp(tk.Tk):
         h_row.pack(fill="x", pady=4)
         ttk.Button(h_row, text="Apply firewall mode", command=self._apply_fw).pack(side="left", pady=6)
         ttk.Button(h_row, text="Run Encryption Hardening", command=self._trigger_hardening).pack(side="left", padx=10, pady=6)
-        
+
+        wild = ttk.Frame(self.tab_fw)
+        wild.pack(fill="x", pady=4)
+        self.wildcard_on = tk.BooleanVar(value=False)
+        self.port_lock_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(wild, text="0.0.0.0", variable=self.wildcard_on, command=self._toggle_wildcard).pack(side="left")
+        ttk.Checkbutton(wild, text="Port lock", variable=self.port_lock_on, command=self._toggle_port_lock).pack(side="left", padx=12)
+        ttk.Label(wild, text="VPN starts off. Port lock is off until checked.").pack(side="left", padx=8)
+
         self.fw_status = ttk.Label(self.tab_fw, text="")
         self.fw_status.pack(anchor="w", pady=(8, 0))
 
@@ -406,7 +430,50 @@ class NetLockApp(tk.Tk):
             lines = netlock.apply_encryption_hardening()
             for line in lines:
                 print(line)
+            print(netlock.restore_firewall_if_triggered())
         self._run("System Policy Hardening", work)
+
+    def _watch_firewall(self) -> None:
+        def work():
+            msg = netlock.restore_firewall_if_triggered()
+            if msg != "Firewall not triggered.":
+                self.after(0, lambda text=msg: self._log(text))
+        threading.Thread(target=work, name="fw-restore", daemon=True).start()
+        self.after(15000, self._watch_firewall)
+
+    def _toggle_wildcard(self) -> None:
+        enabled = bool(self.wildcard_on.get())
+
+        def work():
+            import dhcp_bind
+            import secure_server
+            if not enabled:
+                print(secure_server.stop())
+                persist.write_applied_and_save({"wildcard": False})
+                print("0.0.0.0 off. Parallel workers keep their 16 binds.")
+                return
+            bound = dhcp_bind.auto_bind_and_save()
+            print(f"Auto bind: {bound.get('dhcp_ip')} dns={bound.get('dhcp_dns')}")
+            started = secure_server.start_background()
+            persist.write_applied_and_save({"wildcard": True, "wildcard_configured": bool(started.get("ok"))})
+            print(f"0.0.0.0 on {started}")
+
+        self._run("0.0.0.0 " + ("on" if enabled else "off"), work)
+
+    def _toggle_port_lock(self) -> None:
+        enabled = bool(self.port_lock_on.get())
+
+        def work():
+            try:
+                port = int(self.port_var.get().strip() or 51821)
+            except ValueError:
+                port = 51821
+            print(netlock.set_port_lock(enabled, port))
+            persist.write_applied_and_save({"port_lock": enabled, "firewall_mode": self.fw_mode.get() or "off"})
+            if enabled:
+                print(netlock.restore_firewall_if_triggered())
+
+        self._run("Port lock " + ("on" if enabled else "off"), work)
     def _apply_fw(self) -> None:
         state = netlock.load_state()
         try:
@@ -559,6 +626,8 @@ class NetLockApp(tk.Tk):
             print(f"Applied: {persist.APPLIED_FILE}")
             print(f"Save: {persist.SAVE_FILE}")
 
+        self._run("Stop all", work)
+
     def _refresh_all(self) -> None:
         saved = persist.load_save()
         st = netlock.load_state()
@@ -577,7 +646,98 @@ class NetLockApp(tk.Tk):
             f"\nVPN running flag: {saved.get('vpn_running')}"
         )
         self.vpn_status.delete("1.0", "end")
-        self.vpn_status.insert("1.0", vpn_server.status_text() + extra)
+        self.vpn_status.insert("1.0", vpn_server.status_text(probe=False) + extra)
+
+    def _build_parallel(self) -> None:
+        ttk.Label(
+            self.tab_parallel,
+            text="Starts secure_server, secure_stream, and parallel_processor. Fields fill from the firewall mode and VPN server bind.",
+            wraplength=650,
+        ).pack(anchor="w", fill="x")
+        form = ttk.Frame(self.tab_parallel)
+        form.pack(fill="x", pady=6)
+        self.par_mode = tk.StringVar()
+        self.par_port = tk.StringVar()
+        self.par_dns = tk.StringVar()
+        self.par_bind = tk.StringVar()
+        self.par_socks = tk.StringVar()
+        self.par_public = tk.StringVar()
+        self.par_wild = tk.StringVar()
+        fields = (
+            ("Firewall mode", self.par_mode),
+            ("Tunnel port", self.par_port),
+            ("DNS", self.par_dns),
+            ("VPN bind", self.par_bind),
+            ("SOCKS port", self.par_socks),
+            ("Public bind", self.par_public),
+            ("Wildcard", self.par_wild),
+        )
+        for label, var in fields:
+            row = ttk.Frame(form)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=label, width=16).pack(side="left")
+            ttk.Entry(row, textvariable=var, width=42).pack(side="left", padx=6)
+        btn = ttk.Frame(self.tab_parallel)
+        btn.pack(fill="x", pady=6)
+        ttk.Button(btn, text="Fill from firewall and VPN", command=self._fill_parallel).pack(side="left")
+        ttk.Button(btn, text="Start processes", command=self._start_parallel).pack(side="left", padx=8)
+        self.par_status = tk.Text(self.tab_parallel, height=12, wrap="word")
+        self.par_status.pack(fill="both", expand=True, pady=6)
+        self._fill_parallel()
+
+    def _fill_parallel(self) -> None:
+        settings = parallel_tab.load_settings()
+        self.par_mode.set(str(settings.get("firewall_mode") or "off"))
+        self.par_port.set(str(settings.get("tunnel_port") or ""))
+        self.par_dns.set(str(settings.get("dns") or ""))
+        self.par_bind.set(str(settings.get("bind") or ""))
+        self.par_socks.set(str(settings.get("socks_port") or ""))
+        self.par_public.set(f"{settings.get('public_bind')}:{settings.get('public_port')}")
+        self.par_wild.set("true" if settings.get("wildcard") else "false")
+        if hasattr(self, "fw_mode"):
+            self.fw_mode.set(self.par_mode.get())
+        if hasattr(self, "port_var"):
+            self.port_var.set(self.par_port.get())
+        if hasattr(self, "dns_var"):
+            self.dns_var.set(self.par_dns.get())
+        snap = parallel_tab.snapshot()
+        lines = [
+            f"Pools: {settings.get('pool_16')} bind / {settings.get('pool_256')} workers",
+            f"Wildcard online: {bool(self.wildcard_on.get()) if hasattr(self, 'wildcard_on') else False}",
+            "Binds:",
+        ]
+        for row in snap.get("binds") or []:
+            lines.append("  " + str(row.get("line") or row.get("app") or ""))
+        if len(lines) == 3:
+            lines.append("  (none yet)")
+        self.par_status.delete("1.0", "end")
+        self.par_status.insert("1.0", "\n".join(lines))
+
+    def _start_parallel(self) -> None:
+        public = self.par_public.get().strip()
+        public_bind, _, public_port = public.partition(":")
+        settings = {
+            "firewall_mode": self.par_mode.get().strip() or "off",
+            "tunnel_port": self.par_port.get().strip() or "51821",
+            "dns": self.par_dns.get().strip(),
+            "bind": self.par_bind.get().strip() or "127.0.0.1",
+            "socks_port": self.par_socks.get().strip() or "1080",
+            "public_bind": public_bind.strip() or "0.0.0.0",
+            "public_port": public_port.strip() or "51822",
+            "wildcard": str(self.par_wild.get()).strip().lower() in {"1", "true", "yes", "on"},
+            "wildcard_online": bool(self.wildcard_on.get()) if hasattr(self, "wildcard_on") else False,
+        }
+
+        def work():
+            result = parallel_tab.start_processes(settings)
+            print(f"Wildcard {result.get('wildcard')}")
+            print(f"Secure {result.get('secure')}")
+            print(f"Stream {result.get('stream')}")
+            print(f"Parallel {result.get('parallel')}")
+
+        self._run("Start parallel processes", work)
+        self.after(400, self._fill_parallel)
+
     def _build_connections(self) -> None:
         ttk.Label(
             self.tab_conn,
@@ -675,20 +835,34 @@ class NetLockApp(tk.Tk):
         except Exception:
             port = 51821
         flagged = guard.scan_and_act(kill=True, tunnel_port=port)
-        self._log(f"Flagged {len(flagged)} sockets; attempted terminate on blocked/sql/vpn tags.")
+        self._log(f"Flagged {len(flagged)} sockets; SQL/VPN ports observed only, not locked.")
         for row in flagged[:20]:
             self._log(f"  {row.get('tag')} {row.get('local')} -> {row.get('remote')} pid={row.get('pid')} {row.get('action','')}")
         self._refresh_connections()
     def _boot_shield(self) -> None:
-        """On launch: bind LAN + gateway into VPN+SQL shield and force HTTP/HTTPS through AES."""
+        """Schedule launch work off the Tk thread so the window stays responsive."""
         self._log("--- Launch shield ---")
-        
-        # Enforce encryption profiles across target network interfaces during validation phases
+        threading.Thread(target=self._boot_shield_work, name="boot-shield", daemon=True).start()
+
+    def _boot_shield_work(self) -> None:
+        """On launch: bind LAN + gateway into VPN+SQL shield and force HTTP/HTTPS through AES."""
+        persist.write_applied_and_save({"wildcard": False, "wildcard_configured": False})
+        self.after(0, lambda: self._log("0.0.0.0 is off. Turn it on from the Firewall tab."))
+        try:
+            import parallel_processor
+            preloaded = parallel_processor.preload_binds()
+            self.after(0, lambda n=len(preloaded): self._log(f"Preloaded {n} process binds"))
+        except Exception as exc:
+            self.after(0, lambda e=exc: self._log(f"Process preload skipped: {e}"))
+
         if self.admin:
-            self._log("Enforcing active transport encryption policies...")
+            self.after(0, lambda: self._log("Enforcing active transport encryption policies..."))
             hardening_results = netlock.apply_encryption_hardening()
             for log_entry in hardening_results:
-                self._log(f"  {log_entry}")
+                self.after(0, lambda line=log_entry: self._log(f"  {line}"))
+            restored = netlock.restore_firewall_if_triggered()
+            self.after(0, lambda msg=restored: self._log(msg))
+        self.after(0, self._watch_firewall)
 
         info = network_boot.local_and_gateway()
         persist.write_applied_and_save(
@@ -702,34 +876,36 @@ class NetLockApp(tk.Tk):
                 "tunnel_dns": info.get("dns") or [],
             }
         )
-        self._log(f"Local IPv4: {info.get('local_ip') or '(none)'}")
-        self._log(f"Gateway:    {info.get('gateway') or '(none)'}")
-        self._log(f"Adapter:    {info.get('adapter') or '(unknown)'}")
-        self._log(f"Kind:       {info.get('kind') or '(unknown)'}")
+        self.after(0, lambda: self._log(f"Local IPv4: {info.get('local_ip') or '(none)'}"))
+        self.after(0, lambda: self._log(f"Gateway:    {info.get('gateway') or '(none)'}"))
+        self.after(0, lambda: self._log(f"Adapter:    {info.get('adapter') or '(unknown)'}"))
+        self.after(0, lambda: self._log(f"Kind:       {info.get('kind') or '(unknown)'}"))
         if info.get("internet_ok"):
-            self._log(
+            self.after(0, lambda: self._log(
                 f"Broadband:  {info.get('broadband_target')}:{info.get('broadband_port')} "
                 f"on {info.get('kind')}"
-            )
+            ))
         if info.get("dns"):
-            self.dns_var.set(",".join(info["dns"]))
+            dns_text = ",".join(info["dns"])
+            self.after(0, lambda t=dns_text: self.dns_var.set(t))
         try:
             import dhcp_bind
 
             bound = dhcp_bind.auto_bind_and_save()
-            self._log(f"DHCP bind: {bound.get('dhcp_ip') or '(none)'}")
-            self._log(f"Protected DNS: {', '.join(bound.get('protected_dns') or []) or '(none)'}")
+            self.after(0, lambda: self._log(f"DHCP bind: {bound.get('dhcp_ip') or '(none)'}"))
+            self.after(0, lambda: self._log(f"Protected DNS: {', '.join(bound.get('protected_dns') or []) or '(none)'}"))
             if bound.get("dhcp_dns"):
-                self.dns_var.set(",".join(bound["dhcp_dns"]))
+                dns_text = ",".join(bound["dhcp_dns"])
+                self.after(0, lambda t=dns_text: self.dns_var.set(t))
             
             try:
                 p_val = int(self.port_var.get().strip() or 51821)
             except ValueError:
                 p_val = 51821
-            print(dhcp_bind.apply_http_https_vpn(p_val))
-            self.fw_mode.set("http-https-vpn")
+            self.after(0, lambda: self.fw_mode.set("off"))
+            persist.write_applied_and_save({"firewall_mode": "off"})
         except Exception as exc:
-            self._log(f"DHCP bind skipped: {exc}")
+            self.after(0, lambda e=exc: self._log(f"DHCP bind skipped: {e}"))
 
         state = netlock.load_state()
         try:
@@ -740,9 +916,9 @@ class NetLockApp(tk.Tk):
         if dns:
             state["tunnel_dns"] = dns
         if info.get("kind") == "pdanet":
-            self._log("PdaNet detected — using the established tether as the Internet path.")
+            self.after(0, lambda: self._log("PdaNet detected — using the established tether as the Internet path."))
         elif str(info.get("kind") or "").startswith("modem_router"):
-            self._log("Modem/router detected — auto-filled local IP, gateway, and DNS.")
+            self.after(0, lambda: self._log("Modem/router detected — auto-filled local IP, gateway, and DNS."))
         netlock.save_state(state)
 
         def work():
@@ -772,47 +948,94 @@ class NetLockApp(tk.Tk):
             print("Open apps get a temporary 127.0.0.1 proxy; closing the app drops that proxy.")
             print("PdaNet/modem-router 192.x address was applied to NetLockTUN (LAN IP, not NIC name).")
 
-        self._run("Prepare driver, PdaNet/router IP, browser + app proxies (server OFF)", work)
-    def _poll_stream(self) -> None:
+        self.after(0, lambda: self._log("--- Prepare driver, PdaNet/router IP, browser + app proxies (server OFF) ---"))
+        out = capture(work)
+        if out.strip():
+            self.after(0, lambda text=out: self._log(text))
+        self.after(0, self._refresh_all)
+    def _ui(self, fn) -> None:
         try:
-            import netlock_net
-            import stream
+            if not self.winfo_exists():
+                return
+            self.after(0, fn)
+        except (RuntimeError, tk.TclError):
+            return
 
-            rec = persist.load_applied()
-            stream.poll_nic()
-            ip = rec.get("dhcp_ip") or rec.get("bind") or rec.get("local_ip") or ""
-            port = rec.get("broadband_port") or 8000
-            attached = rec.get("c_net") or {}
-            if not attached.get("ok") and ip:
-                attached = netlock_net.attach_existing_broadband(str(ip), int(port))
-            snap = stream.snapshot(60)
-            self.stream_status.config(
-                text=(
-                    f"Upload {snap.get('upload', '0 bps')}   "
-                    f"Download {snap.get('download', '0 bps')}   "
-                    f"total ↑{snap['bytes_up']} B  ↓{snap['bytes_down']} B   "
-                    f"bind {attached.get('ip') or ip}:{attached.get('port') or port}   "
-                    f"ok={attached.get('ok')}"
-                )
-            )
-            body = "\n".join(snap["lines"])
-            current = self.stream.get("1.0", "end-1c")
-            if body != current:
-                self.stream.delete("1.0", "end")
-                self.stream.insert("1.0", body or "(waiting for traffic)")
-                self.stream.see("end")
-        except Exception as exc:
-            self.stream_status.config(text=f"stream error: {exc}")
-        self.after(800, self._poll_stream)
+    def _poll_stream(self) -> None:
+        if getattr(self, "_stream_poll_busy", False):
+            self.after(800, self._poll_stream)
+            return
+        self._stream_poll_busy = True
+
+        def work() -> None:
+            payload = {"error": ""}
+            try:
+                import netlock_net
+                import stream
+
+                rec = persist.load_applied()
+                stream.poll_nic()
+                ip = rec.get("dhcp_ip") or rec.get("bind") or rec.get("local_ip") or ""
+                port = rec.get("broadband_port") or 8000
+                attached = rec.get("c_net") or {}
+                if not attached.get("ok") and ip:
+                    attached = netlock_net.attach_existing_broadband(str(ip), int(port))
+                snap = stream.snapshot(60)
+                payload = {"snap": snap, "attached": attached, "ip": ip, "port": port}
+            except Exception as exc:
+                payload = {"error": str(exc)}
+
+            def apply() -> None:
+                self._stream_poll_busy = False
+                if payload.get("error"):
+                    self.stream_status.config(text=f"stream error: {payload['error']}")
+                else:
+                    snap = payload["snap"]
+                    attached = payload["attached"]
+                    ip = payload["ip"]
+                    port = payload["port"]
+                    self.stream_status.config(
+                        text=(
+                            f"Upload {snap.get('upload', '0 bps')}   "
+                            f"Download {snap.get('download', '0 bps')}   "
+                            f"total ↑{snap['bytes_up']} B  ↓{snap['bytes_down']} B   "
+                            f"bind {attached.get('ip') or ip}:{attached.get('port') or port}   "
+                            f"ok={attached.get('ok')}"
+                        )
+                    )
+                    body = "\n".join(snap["lines"])
+                    current = self.stream.get("1.0", "end-1c")
+                    if body != current:
+                        self.stream.delete("1.0", "end")
+                        self.stream.insert("1.0", body or "(waiting for traffic)")
+                        self.stream.see("end")
+                self.after(800, self._poll_stream)
+
+            self._ui(apply)
+
+        threading.Thread(target=work, name="stream-poll", daemon=True).start()
 
     def _poll_link(self) -> None:
-        try:
-            info = vpn_server.link_status()
-            label = info.get("label") or "DEAD"
-            self.link_label.config(text=f"OUTSIDE: {label}")
-        except Exception:
-            self.link_label.config(text="OUTSIDE: DEAD")
-        self.after(8000, self._poll_link)
+        if getattr(self, "_link_poll_busy", False):
+            self.after(8000, self._poll_link)
+            return
+        self._link_poll_busy = True
+
+        def work() -> None:
+            try:
+                info = vpn_server.link_status()
+                label = info.get("label") or "DEAD"
+            except Exception:
+                label = "DEAD"
+
+            def apply() -> None:
+                self._link_poll_busy = False
+                self.link_label.config(text=f"OUTSIDE: {label}")
+                self.after(8000, self._poll_link)
+
+            self._ui(apply)
+
+        threading.Thread(target=work, name="link-poll", daemon=True).start()
 
     def _on_tab(self, _event=None) -> None:
         try:
@@ -821,6 +1044,8 @@ class NetLockApp(tk.Tk):
             return
         if current == "All connections":
             self._refresh_connections()
+        elif current == "Parallel processes":
+            self._fill_parallel()
 
 
 def main() -> int:
@@ -834,8 +1059,19 @@ def main() -> int:
             pass
         return 1
     app.mainloop()
+    try:
+        import network_boot
+        network_boot.restore_original_and_wait()
+    except Exception:
+        traceback.print_exc()
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

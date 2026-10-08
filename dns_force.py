@@ -44,9 +44,14 @@ def restore_windows_dns() -> str:
     if os.name != "nt":
         return "DNS skip"
     cmd = (
-        "Get-DnsClient | ForEach-Object { "
-        "Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex -ResetServerAddresses "
-        "-ErrorAction SilentlyContinue }"
+        "$adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue); "
+        "foreach ($a in $adapters) { "
+        "Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue; "
+        "netsh interface ipv4 set dnsservers name=\"$($a.Name)\" source=dhcp | Out-Null; "
+        "netsh interface ipv6 set dnsservers name=\"$($a.Name)\" source=dhcp | Out-Null "
+        "}; "
+        "Get-DnsClient -ErrorAction SilentlyContinue | ForEach-Object { "
+        "Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex -ResetServerAddresses -ErrorAction SilentlyContinue }"
     )
     subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, text=True)
     return "Windows DNS reset to DHCP/automatic"
@@ -95,3 +100,8 @@ def start() -> str:
 def stop() -> str:
     _stop.set()
     return restore_windows_dns()
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

@@ -210,3 +210,8 @@ def stop() -> str:
     _adapter = None
     _msg = "Wintun stopped"
     return _msg
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

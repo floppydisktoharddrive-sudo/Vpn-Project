@@ -77,6 +77,15 @@ def read_dhcp() -> dict:
         m = re.search(r"DHCP Server[^\d]*(\d+\.\d+\.\d+\.\d+)", ipcfg, re.I)
         if m:
             info["lease_server"] = m.group(1)
+        adapter = info.get("adapter") or ""
+        if adapter:
+            for block in re.split(r"\r?\n(?=\S)", ipcfg):
+                if adapter.lower() not in block.lower():
+                    continue
+                am = re.search(r"DHCP Server[^\d]*(\d+\.\d+\.\d+\.\d+)", block, re.I)
+                if am:
+                    info["lease_server"] = am.group(1)
+                break
         if not info["dns"]:
             for m in re.finditer(r"DNS Servers[^\d]*((\d+\.\d+\.\d+\.\d+\s*)+)", ipcfg, re.I):
                 info["dns"].extend(re.findall(r"\d+\.\d+\.\d+\.\d+", m.group(1)))
@@ -100,11 +109,82 @@ def read_dhcp() -> dict:
     # unique dns
     seen, dns = set(), []
     for d in info["dns"]:
-        if d not in seen and d not in {"0.0.0.0"}:
+        low = str(d).strip().lower()
+        if d not in seen and d not in {"0.0.0.0"} and not low.startswith("fec0:"):
             seen.add(d)
             dns.append(d)
     info["dns"] = dns
     return info
+
+
+def _protected_dns_keep(server: str) -> bool:
+    host = (server or "").strip().lower()
+    if not host or host.startswith("fec0:"):
+        return False
+    return True
+
+
+def _same_subnet(ip: str, gateway: str) -> bool:
+    try:
+        a = [int(x) for x in ip.split(".")]
+        b = [int(x) for x in gateway.split(".")]
+    except ValueError:
+        return False
+    return len(a) == 4 and len(b) == 4 and a[:3] == b[:3]
+
+
+def _dns_answers(server: str, timeout: float = 1.5) -> bool:
+    """Ask the server a short A query. A reply means this DNS is live."""
+    import socket
+
+    query = bytes.fromhex(
+        "000101000001000000000000076578616d706c6503636f6d0000010001"
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(query, (server, 53))
+        data, _ = sock.recvfrom(512)
+        return len(data) >= 12
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def verify_gateway_dns(gateway: str, servers: list[str]) -> dict:
+    """Keep only DNS servers that answer, and require the gateway DNS to answer."""
+    gw = (gateway or "").strip()
+    ordered: list[str] = []
+    for server in [gw] + list(servers or []):
+        if not server or server in ordered or server in {"0.0.0.0", "1.0.0.0"}:
+            continue
+        if server.lower().startswith("fec0:"):
+            continue
+        ordered.append(server)
+    live = [server for server in ordered if _dns_answers(server)]
+    gateway_ok = bool(gw) and gw in live
+    verified = [gw] + [server for server in live if server != gw] if gateway_ok else live
+    return {"ok": gateway_ok, "gateway": gw, "dns": verified, "live": live}
+
+
+def verify_dhcp_binding(info: dict) -> dict:
+    """The leased address, gateway, and DHCP server must belong to the same binding."""
+    ip = (info.get("ip") or "").strip()
+    gateway = (info.get("gateway") or "").strip()
+    lease = (info.get("lease_server") or "").strip()
+    ok = bool(ip) and bool(gateway) and _same_subnet(ip, gateway)
+    if lease and lease != gateway:
+        ok = False
+    if ip.startswith("192.") and gateway and _same_subnet(ip, gateway):
+        ok = True
+    return {
+        "ok": ok,
+        "ip": ip,
+        "gateway": gateway,
+        "lease_server": lease,
+        "adapter": info.get("adapter") or "",
+    }
 
 
 def protect_dhcp_dns(dns: list[str]) -> list[str]:
@@ -112,11 +192,11 @@ def protect_dhcp_dns(dns: list[str]) -> list[str]:
     import blocker
 
     data = blocker.load_filter()
-    protected = list(data.get("protected_dns") or [])
-    for server in dns:
-        if server and server not in protected:
-            protected.append(server)
-        # DNS hostnames are IPs; also keep them off the IP blacklist.
+    protected: list[str] = []
+    for server in list(dns or []):
+        if not _protected_dns_keep(server) or server in protected or server in {"0.0.0.0", "127.0.0.1"}:
+            continue
+        protected.append(server)
         if server in data.get("ip_blacklist", []):
             data["ip_blacklist"] = [x for x in data["ip_blacklist"] if x != server]
     data["protected_dns"] = protected
@@ -171,16 +251,44 @@ def apply_http_https_vpn(tunnel_port: int = 51821) -> str:
     return "HTTP/HTTPS on 127.0.0.1:8080; VPN monitors connectivity in parallel"
 
 
-def auto_bind_and_save() -> dict:
+def clear_old_bind_config() -> None:
+    """Drop the saved bind, DNS, and lease so a failed binding is not reused."""
+    import blocker
+    import vpn_server
+
+    vpn = vpn_server.load_state()
+    vpn["bind"] = ""
+    vpn["dns"] = []
+    vpn_server.save_state(vpn)
+    data = blocker.load_filter()
+    data["protected_dns"] = []
+    blocker.save_filter(data)
+    persist.write_applied_and_save(
+        {
+            "bind": "",
+            "dhcp_ip": "",
+            "dhcp_gateway": "",
+            "dhcp_dns": [],
+            "protected_dns": [],
+            "dhcp_binding_ok": False,
+            "dhcp_lease_server": "",
+            "dhcp_adapter": "",
+        }
+    )
+
+
+def auto_bind_and_save(retry: bool = True) -> dict:
     """Detect DHCP address/DNS, protect that DNS, bind the tunnel, save everything."""
     import vpn_server
 
     dhcp = read_dhcp()
     fw = detect_firewall()
-    dns = dhcp.get("dns") or []
+    binding = verify_dhcp_binding(dhcp)
+    checked = verify_gateway_dns(dhcp.get("gateway") or "", dhcp.get("dns") or [])
+    dns = checked["dns"] if checked["ok"] and binding["ok"] else []
     protected = protect_dhcp_dns(dns)
     ip = dhcp.get("ip") or ""
-    if ip.startswith("192.") or ip:
+    if binding["ok"] and ip:
         vpn_state = vpn_server.load_state()
         vpn_state["bind"] = ip
         if dns:
@@ -191,10 +299,12 @@ def auto_bind_and_save() -> dict:
             "dhcp_ip": ip,
             "dhcp_gateway": dhcp.get("gateway"),
             "dhcp_dns": dns,
+            "dhcp_dns_verified": checked["ok"],
+            "dhcp_binding_ok": binding["ok"],
             "dhcp_adapter": dhcp.get("adapter"),
             "dhcp_enabled": dhcp.get("dhcp_enabled"),
             "dhcp_lease_server": dhcp.get("lease_server"),
-            "bind": ip,
+            "bind": ip if binding["ok"] else "",
             "http_proxy": "127.0.0.1:8080",
             "vpn_monitors_only": True,
             "protected_dns": protected,
@@ -203,4 +313,13 @@ def auto_bind_and_save() -> dict:
             "firewall_profiles": list((fw.get("profiles") or {}).keys()),
         }
     )
+    if retry and not binding["ok"]:
+        print("binding=fail — clearing old configurations and trying again")
+        clear_old_bind_config()
+        return auto_bind_and_save(retry=False)
     return rec
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

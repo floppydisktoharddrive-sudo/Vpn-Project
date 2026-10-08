@@ -28,18 +28,35 @@ SQL_RE = re.compile(
     rb"(?i)(\bunion\s+select\b|\bor\s+1\s*=\s*1\b|\bdrop\s+table\b|\binsert\s+into\b"
     rb"|\bupdate\s+\w+\s+set\b|\bdelete\s+from\b|'?\s*or\s+'1'\s*=\s*'1)",
 )
+BRUTE_RE = re.compile(
+    rb"(?i)(password=|passwd=|authorization:\s*basic|login failed|invalid password|authentication failed|wp-login\.php)",
+)
+MALWARE_RE = re.compile(
+    rb"(?i)(<script|javascript:|powershell\s+-enc|cmd\.exe\s+/c|eval\s*\(|document\.write|fromcharcode|certutil\s+-urlcache|/bin/sh)",
+)
+_attempts: dict[str, int] = defaultdict(int)
 
 _hits: list[str] = []
 _lock = threading.Lock()
 _malware_findings: list[dict] = []
 
 
-def inspect_payload(data: bytes) -> str | None:
+def inspect_payload(data: bytes, peer: str = "") -> str | None:
     if not data:
         return None
     sample = data[:8192]
     if SQL_RE.search(sample):
         return "sql-injection"
+    if MALWARE_RE.search(sample) or sample[:2] == b"MZ":
+        return "malware-injection"
+    if BRUTE_RE.search(sample):
+        key = peer or "unknown"
+        with _lock:
+            _attempts[key] = _attempts.get(key, 0) + 1
+            count = _attempts[key]
+        if count >= 3:
+            return "brute-force"
+        return "brute-force"
     return None
 
 
@@ -49,6 +66,11 @@ def note_hit(kind: str, detail: str) -> None:
         if len(_hits) > 200:
             del _hits[:100]
     persist.write_applied_and_save({"last_engine_hit": f"{kind}: {detail}"})
+    try:
+        import secure_stream
+        secure_stream.rotate_now("attack")
+    except Exception:
+        pass
     try:
         path = vpn_server.generate_session_key()
         if vpn_server._runtime is not None:
@@ -279,3 +301,8 @@ def delete_malware(paths: list[str] | None = None) -> list[dict]:
 def recent_hits() -> list[str]:
     with _lock:
         return list(_hits[-20:])
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

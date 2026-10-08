@@ -29,14 +29,25 @@ _live: dict[str, dict] = {}
 _lock = threading.Lock()
 
 
-def _pipe(a: socket.socket, b: socket.socket) -> None:
+def _pipe(a: socket.socket, b: socket.socket, host: str = "") -> None:
+    import data_stream
+    upload = data_stream.upload_host(host)
+
     def one(src, dst):
+        pending = bytearray()
+        uploading = upload and src is a
         try:
             while True:
                 data = src.recv(65536)
                 if not data:
                     break
-                dst.sendall(data)
+                if uploading:
+                    data_stream.send_upload_bytes(dst, data)
+                    continue
+                data_stream.send_small(src, dst, data, pending)
+            rest = data_stream.drain_small(pending)
+            if rest:
+                dst.sendall(rest)
         except OSError:
             pass
         try:
@@ -112,7 +123,7 @@ def _handle(client: socket.socket) -> None:
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         else:
             remote.sendall(b"".join(headers))
-        _pipe(client, remote)
+        _pipe(client, remote, host)
     except Exception:
         pass
     finally:
@@ -145,7 +156,16 @@ def _serve(port: int, key: str) -> None:
             continue
         except OSError:
             break
-        _pool.submit(_handle, conn)
+        try:
+            _pool.submit(_handle, conn)
+        except RuntimeError:
+            # Executor already shut down during interpreter exit.
+            _stop.set()
+            try:
+                conn.close()
+            except OSError:
+                pass
+            break
     try:
         srv.close()
     except OSError:
@@ -233,3 +253,8 @@ def stop() -> str:
     for pid in pids:
         stop_one(pid)
     return "Per-app proxies stopped."
+try:
+    import worker_pool
+    worker_pool.attach(__name__)
+except Exception:
+    pass

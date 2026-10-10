@@ -23,7 +23,7 @@ if defined ADAPTER (
   timeout /t 2 /nobreak >nul
   netsh interface set interface name="%ADAPTER%" admin=enabled
 ) else (
-  echo [soft reset] No adapter name — skipping NIC bounce.
+  echo [soft reset] No adapter name -- skipping NIC bounce.
 )
 
 echo [soft reset] DHCP renew and DNS client bounce...

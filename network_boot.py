@@ -123,7 +123,7 @@ def probe_broadband_192(local_ip: str, gateway: str = "", timeout: float = 3.0) 
                 s.close()
             except OSError:
                 pass
-    # Do not report success just because the address is 192.x — that hid real
+    # Do not report success just because the address is 192.x -- that hid real
     # connect failures and made boot skip DHCP repair.
     return False, local_ip if _is_192(local_ip) else "", BROADBAND_PORT
 
@@ -457,7 +457,7 @@ def reset_to_default(log: Callable[[str], None] | None = None) -> list[str]:
             print(msg)
 
     if os.name != "nt":
-        say("Not Windows — skipped adapter reset.")
+        say("Not Windows -- skipped adapter reset.")
         return notes
 
     say("Resetting WinHTTP and user proxy to default (direct)...")
@@ -504,7 +504,7 @@ def repair_if_offline(log: Callable[[str], None] | None = None) -> list[str]:
         say("Offline repair skipped (not Windows).")
         return notes
 
-    say("No Internet — running adapter diagnostics...")
+    say("No Internet -- running adapter diagnostics...")
     info = local_and_gateway()
     say(f"  Local IPv4 : {info.get('local_ip') or '(none)'}")
     say(f"  Gateway    : {info.get('gateway') or '(none)'}")
@@ -515,7 +515,7 @@ def repair_if_offline(log: Callable[[str], None] | None = None) -> list[str]:
     flag = Path(__file__).resolve().parent / "vpn_data" / "need_soft_reset.flag"
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.write_text(adapter, encoding="utf-8")
-    say("Offline only — soft adapter + Winsock reset. Desktop stays logged in. No reboot.")
+    say("Offline only -- soft adapter + Winsock reset. Desktop stays logged in. No reboot.")
     bat = Path(__file__).resolve().parent / "soft_reset.bat"
     if bat.exists():
         say(f"Running {bat.name} for '{adapter or 'all adapters'}'...")
@@ -525,7 +525,7 @@ def repair_if_offline(log: Callable[[str], None] | None = None) -> list[str]:
         except OSError:
             pass
     else:
-        say("soft_reset.bat missing — running the same steps inline.")
+        say("soft_reset.bat missing -- running the same steps inline.")
         _run(["netsh", "winsock", "reset"], timeout=60)
         _run(["netsh", "int", "ip", "reset"], timeout=60)
         _run(["netsh", "winhttp", "reset", "proxy"])
@@ -550,9 +550,9 @@ def boot_network() -> dict:
     info = local_and_gateway()
     ok, detail = probe_internet(info=info)
     if ok:
-        print("Internet already working — skipping adapter reset so the session stays up.")
+        print("Internet already working -- skipping adapter reset so the session stays up.")
     else:
-        print("Internet not reachable — resetting adapters to default.")
+        print("Internet not reachable -- resetting adapters to default.")
         reset_to_default()
         info = local_and_gateway()
     print(f"Local IPv4 : {info.get('local_ip') or '(none)'}")
@@ -565,7 +565,7 @@ def boot_network() -> dict:
         for line in info["candidates"]:
             print(f"  {line}")
     ok, detail = probe_internet(info=info)
-    print(f"Internet   : {'OK reachable — ' + detail if ok else 'FAIL — ' + detail}")
+    print(f"Internet   : {'OK reachable -- ' + detail if ok else 'FAIL -- ' + detail}")
     if not ok:
         repair_if_offline()
         info = local_and_gateway()
@@ -574,7 +574,7 @@ def boot_network() -> dict:
         print(f"Gateway    : {info.get('gateway') or '(none)'}")
         print(f"Kind       : {info.get('kind') or '(unknown)'}")
         ok, detail = probe_internet(info=info)
-        print(f"Internet   : {'OK reachable — ' + detail if ok else 'FAIL — ' + detail}")
+        print(f"Internet   : {'OK reachable -- ' + detail if ok else 'FAIL -- ' + detail}")
         if not ok:
             print("Still offline. Check the cable/Wi-Fi radio or PdaNet tether, then start the GUI anyway.")
     persist.write_applied_and_save(

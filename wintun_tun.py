@@ -184,7 +184,7 @@ def _loop() -> None:
             continue
         if proto == 17 and len(buf) >= 28:
             dport = int.from_bytes(buf[22:24], "big")
-            # Do not note_hit DNS/QUIC — that rotates the AES session key and stalls YouTube.
+            # Do not note_hit DNS/QUIC -- that rotates the AES session key and stalls YouTube.
             if dport in {53, 443}:
                 continue
         # Skip deep inspect on large UDP/TCP video-sized packets

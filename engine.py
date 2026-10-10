@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Local heuristic engine — not a commercial antivirus.
+Local heuristic engine -- not a commercial antivirus.
 
 Detects:
   - SQL injection patterns in cleartext HTTP

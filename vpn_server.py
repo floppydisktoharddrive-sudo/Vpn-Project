@@ -1129,7 +1129,7 @@ def status_text(probe: bool = True) -> str:
     link = link_status(probe=probe)
     return "\n".join(
         [
-            "Engine: built-in AES-256-GCM — private and public tunnels are separate",
+            "Engine: built-in AES-256-GCM -- private and public tunnels are separate",
             f"Outside link: {link['label']}",
             f"Private live: {live}  (192.x + 127.0.0.1:{state.get('port')})",
             f"Public live: {public_live}  (0.0.0.0:{state.get('public_port', DEFAULT_PUBLIC_PORT)})",
@@ -1139,7 +1139,7 @@ def status_text(probe: bool = True) -> str:
             f"Private SOCKS5: 127.0.0.1:{state.get('socks_port', DEFAULT_SOCKS)}",
             f"Public SOCKS5: 127.0.0.1:{state.get('public_socks_port', DEFAULT_PUBLIC_SOCKS)}",
             f"DNS list: {', '.join(state.get('dns') or [])}",
-            f"Key file: {key_path} ({'present' if key_ok else 'missing — press Generate or Start'})",
+            f"Key file: {key_path} ({'present' if key_ok else 'missing -- press Generate or Start'})",
         ]
     )
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Shared worker pools used by every NetLock module.
 
-pool_16  — server bind and configure tasks
-pool_256 — parallel process workers, 16 per running exe
+pool_16  -- server bind and configure tasks
+pool_256 -- parallel process workers, 16 per running exe
 """
 
 from __future__ import annotations

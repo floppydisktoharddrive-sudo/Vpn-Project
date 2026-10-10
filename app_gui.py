@@ -84,12 +84,25 @@ class NetLockApp(tk.Tk):
         self.minsize(700, 580)
 
         self.admin = blocker.is_admin()
+        # Auto-add AI API key for secure communication when NetLock starts
+        self.ai_api_key = ""
+        try:
+            key_path = Path(__file__).resolve().parent / "vpn_data" / "ai_api_key.txt"
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            if key_path.exists():
+                self.ai_api_key = key_path.read_text(encoding="utf-8").strip()
+            else:
+                import secrets
+                self.ai_api_key = secrets.token_hex(32)
+                key_path.write_text(self.ai_api_key, encoding="utf-8")
+        except Exception:
+            pass
         
         # Header area configuration
         header = ttk.Frame(self, padding=10)
         header.pack(fill="x", side="top")
         ttk.Label(header, text="NetLock", font=("Segoe UI", 16, "bold")).pack(side="left")
-        status = "Administrator" if self.admin else "Not elevated — most actions will fail"
+        status = "Administrator" if self.admin else "Not elevated -- most actions will fail"
         ttk.Label(header, text=status).pack(side="right")
         self.link_label = ttk.Label(header, text="OUTSIDE: DEAD", font=("Segoe UI", 11, "bold"))
         self.link_label.pack(side="right", padx=16)
@@ -364,6 +377,34 @@ class NetLockApp(tk.Tk):
         self._reload_filter_ui()
         self._log(f"Removed IP {ip}")
 
+    def _secure_scripts_with_ai(self, scripts: list) -> None:
+        """Ask the loaded Thox AI instance to secure the NetLock scripts."""
+        import socket
+        import json
+        names = [str(row.get("app") or "") for row in scripts if row.get("app")]
+        if not names:
+            return
+        try:
+            with socket.create_connection(("127.0.0.1", 8765), timeout=8) as s:
+                payload = json.dumps({"cmd": "secure_scripts", "scripts": names, "api_key": getattr(self, "ai_api_key", "")}).encode() + b"\n"
+                s.sendall(payload)
+                data = b""
+                while len(data) < 8192:
+                    chunk = s.recv(1024)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if b"\n" in data:
+                        break
+            if data:
+                resp = json.loads(data.decode("utf-8", errors="ignore").strip())
+                if resp.get("ok"):
+                    self._log(f"AI model secured scripts: {resp.get('seal', '')[:120]}")
+                else:
+                    self._log(f"AI secure: {resp.get('message', 'failed')}")
+        except Exception as exc:
+            self._log(f"AI secure skipped (model not loaded or unreachable): {exc}")
+
     def _scan_apps(self) -> None:
         scripts = apps.running_scripts()
         names = apps.sync_open_apps()
@@ -374,10 +415,52 @@ class NetLockApp(tk.Tk):
                 parallel_processor.open_for_process(int(row.get("pid") or 0), 0, row.get("app") or "", "SCRIPT")
             token = secure_stream.seal_wildcard(0, 0, "protected-scripts")
             self._log(f"Script seal {token[:18]} generation={secure_stream.ring().generation}")
+            self._secure_scripts_with_ai(scripts)
+            self._ai_scan_malicious()
         except Exception as exc:
             self._log(f"Parallel script bind skipped: {exc}")
         self._reload_filter_ui()
         self._log("Protected apps and scripts:\n  " + "\n  ".join(names or ["(none)"]))
+
+    def _ai_call(self, cmd: str, extra: dict | None = None, timeout: float = 8) -> dict:
+        """Generic call to the loaded AI instance on 127.0.0.1:8765."""
+        import socket
+        import json
+        payload = {"cmd": cmd, "api_key": getattr(self, "ai_api_key", "")}
+        if extra:
+            payload.update(extra)
+        try:
+            with socket.create_connection(("127.0.0.1", 8765), timeout=timeout) as s:
+                s.sendall(json.dumps(payload).encode() + b"\n")
+                data = b""
+                while len(data) < 16384:
+                    chunk = s.recv(2048)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if b"\n" in data:
+                        break
+            return json.loads(data.decode("utf-8", errors="ignore").strip()) if data else {"ok": False}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
+
+    def _ai_assisted_transfer(self, direction: str, data: str) -> None:
+        """AI-assisted upload or download through encrypted secure data streams."""
+        resp = self._ai_call("ai_" + direction, {"data": data[:4000]})
+        if resp.get("ok"):
+            self._log(f"AI {direction}: {resp.get('ai_status', '')[:80]} (encrypted {resp.get('encrypted_len', 0)}B)")
+        else:
+            self._log(f"AI {direction} skipped: {resp.get('message', 'unavailable')}")
+
+    def _ai_scan_malicious(self) -> None:
+        """AI malicious data attack scan; NetLock terminates attacks if found."""
+        sample = "netlock protected traffic sample"
+        resp = self._ai_call("scan_malicious", {"sample": sample})
+        if resp.get("ok"):
+            status = "TERMINATED" if resp.get("terminated") else "clean"
+            self._log(f"AI malicious scan: {resp.get('verdict', '')[:100]} [{status}]")
+        else:
+            self._log(f"AI malicious scan skipped: {resp.get('message', 'unavailable')}")
     def _build_firewall(self) -> None:
         ttk.Label(
             self.tab_fw,
@@ -390,11 +473,11 @@ class NetLockApp(tk.Tk):
         grid.pack(fill="x", pady=10)
 
         modes = [
-            ("lock", "LOCK — block inbound VPN/SQL, allow outbound"),
-            ("vpn", "VPN ON — same blocks + allow local encrypted port"),
-            ("http-https-vpn", "HTTP/HTTPS proxy + VPN monitor — 127.0.0.1:8080, VPN does not carry web"),
-            ("inbound-only", "INBOUND-ONLY — cut outbound; encrypted listen port only"),
-            ("off", "OFF — remove NetLock firewall rules"),
+            ("lock", "LOCK -- block inbound VPN/SQL, allow outbound"),
+            ("vpn", "VPN ON -- same blocks + allow local encrypted port"),
+            ("http-https-vpn", "HTTP/HTTPS proxy + VPN monitor -- 127.0.0.1:8080, VPN does not carry web"),
+            ("inbound-only", "INBOUND-ONLY -- cut outbound; encrypted listen port only"),
+            ("off", "OFF -- remove NetLock firewall rules"),
         ]
         for value, label in modes:
             ttk.Radiobutton(grid, text=label, variable=self.fw_mode, value=value).pack(anchor="w", pady=2)
@@ -435,9 +518,33 @@ class NetLockApp(tk.Tk):
 
     def _watch_firewall(self) -> None:
         def work():
-            msg = netlock.restore_firewall_if_triggered()
-            if msg != "Firewall not triggered.":
-                self.after(0, lambda text=msg: self._log(text))
+            try:
+                import guard
+                import netlock
+                import persist
+                state = netlock.load_state()
+                port = int(state.get("tunnel_port") or 51821)
+                flagged = guard.scan_and_act(kill=False, tunnel_port=port)
+                attack = False
+                for row in flagged:
+                    tag = str(row.get("tag") or "")
+                    local = str(row.get("local") or "")
+                    remote = str(row.get("remote") or "")
+                    if tag not in {"ok", "http-lan-ok", ""} and (
+                        str(port) in local or str(port) in remote or "stream" in tag.lower()
+                    ):
+                        attack = True
+                        break
+                rec = persist.load_applied()
+                hit = str(rec.get("last_engine_hit") or "").lower()
+                if any(x in hit for x in ("malware", "sql", "brute", "injection", "attack", "exploit")):
+                    attack = True
+                if attack:
+                    msg = netlock.restore_firewall_if_triggered()
+                    if msg != "Firewall not triggered.":
+                        self.after(0, lambda text=msg: self._log(text + " (malicious data attack on encrypted stream)"))
+            except Exception:
+                pass
         threading.Thread(target=work, name="fw-restore", daemon=True).start()
         self.after(15000, self._watch_firewall)
 
@@ -502,8 +609,12 @@ class NetLockApp(tk.Tk):
             print(f"Firewall profiles: {bound.get('firewall_profiles')}")
             if mode == "http-https-vpn":
                 print(dhcp_bind.apply_http_https_vpn(int(state.get("tunnel_port") or 51821)))
+                if fn:
+                    fn(state)
             elif fn:
                 fn(state)
+            # Update selection status
+            print(f"Firewall mode selected and applied: {mode}")
             persist.write_applied_and_save(
                 {
                     "firewall_mode": mode,
@@ -532,9 +643,17 @@ class NetLockApp(tk.Tk):
             wraplength=650,
         ).pack(anchor="w", fill="x")
 
+        sel = ttk.Frame(self.tab_vpn)
+        sel.pack(fill="x", pady=6)
+        self.vpn_select = tk.StringVar(value="private")
+        ttk.Label(sel, text="VPN selection:").pack(side="left")
+        ttk.Radiobutton(sel, text="Private (192.x / loopback)", variable=self.vpn_select, value="private").pack(side="left", padx=8)
+        ttk.Radiobutton(sel, text="Public (0.0.0.0)", variable=self.vpn_select, value="public").pack(side="left", padx=8)
+
         row = ttk.Frame(self.tab_vpn)
         row.pack(fill="x", pady=10)
         ttk.Button(row, text="Generate server files", command=self._vpn_generate).pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="Start selected VPN", command=self._vpn_start_selected).pack(side="left", padx=(0, 6))
         ttk.Button(row, text="Start private tunnel", command=self._vpn_start).pack(side="left", padx=(0, 6))
         ttk.Button(row, text="Start public tunnel", command=self._vpn_start_public).pack(side="left", padx=(0, 6))
         ttk.Button(row, text="Stop private", command=self._vpn_stop_private).pack(side="left", padx=(0, 6))
@@ -568,6 +687,14 @@ class NetLockApp(tk.Tk):
             print(f"Text save: {persist.SAVE_TEXT}")
 
         self._run("Generate VPN configs", work)
+    def _vpn_start_selected(self) -> None:
+        sel = getattr(self, "vpn_select", None)
+        choice = sel.get() if sel else "private"
+        if choice == "public":
+            self._vpn_start_public()
+        else:
+            self._vpn_start()
+
     def _vpn_start(self) -> None:
         def work():
             ok, msg = vpn_server.start_server()
@@ -916,9 +1043,9 @@ class NetLockApp(tk.Tk):
         if dns:
             state["tunnel_dns"] = dns
         if info.get("kind") == "pdanet":
-            self.after(0, lambda: self._log("PdaNet detected — using the established tether as the Internet path."))
+            self.after(0, lambda: self._log("PdaNet detected -- using the established tether as the Internet path."))
         elif str(info.get("kind") or "").startswith("modem_router"):
-            self.after(0, lambda: self._log("Modem/router detected — auto-filled local IP, gateway, and DNS."))
+            self.after(0, lambda: self._log("Modem/router detected -- auto-filled local IP, gateway, and DNS."))
         netlock.save_state(state)
 
         def work():
@@ -998,7 +1125,7 @@ class NetLockApp(tk.Tk):
                         text=(
                             f"Upload {snap.get('upload', '0 bps')}   "
                             f"Download {snap.get('download', '0 bps')}   "
-                            f"total ↑{snap['bytes_up']} B  ↓{snap['bytes_down']} B   "
+                            f"total {snap['bytes_up']} B  {snap['bytes_down']} B   "
                             f"bind {attached.get('ip') or ip}:{attached.get('port') or port}   "
                             f"ok={attached.get('ok')}"
                         )

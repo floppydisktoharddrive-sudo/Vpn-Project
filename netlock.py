@@ -491,7 +491,7 @@ def restore_firewall_if_triggered(state: dict | None = None) -> str:
     state["mode"] = "off"
     state["port_lock"] = False
     save_state(state)
-    print("Firewall triggered — restored automatically.")
+    print("Firewall triggered -- restored automatically.")
     print("Profile policy restored to inbound-allow / outbound-allow.")
     return "Firewall restored automatically."
 

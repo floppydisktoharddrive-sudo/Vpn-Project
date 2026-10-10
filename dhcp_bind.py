@@ -314,7 +314,7 @@ def auto_bind_and_save(retry: bool = True) -> dict:
         }
     )
     if retry and not binding["ok"]:
-        print("binding=fail — clearing old configurations and trying again")
+        print("binding=fail -- clearing old configurations and trying again")
         clear_old_bind_config()
         return auto_bind_and_save(retry=False)
     return rec

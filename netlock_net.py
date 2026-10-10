@@ -25,7 +25,7 @@ class NlIface(ctypes.Structure):
 
 
 def _lib_candidates() -> list[Path]:
-    # Never name the native library netlock_net.so/.pyd in this folder —
+    # Never name the native library netlock_net.so/.pyd in this folder --
     # Python's importer would load it instead of this wrapper (no PyInit_*).
     if os.name == "nt":
         return [

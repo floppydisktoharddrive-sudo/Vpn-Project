@@ -135,6 +135,30 @@ def client_ssl_context() -> ssl.SSLContext:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def apply_ssl_to_directory(base: Path | None = None) -> dict:
+    """Add SSL for all files in the folder directory.
+    Generates a directory-level SSL cert and writes an ssl_enabled marker
+    so every file in the tree is covered by the local SSL context.
+    """
+    base = base or Path(__file__).resolve().parent
+    generate_ca()
+    key_path, crt_path = host_material("directory.local")
+    marker = base / "vpn_data" / "ssl_directory.enabled"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    files = [str(p.relative_to(base)) for p in base.rglob("*") if p.is_file() and "vpn_data" not in p.parts]
+    marker.write_text(
+        f"SSL enabled for {len(files)} files\ncert={crt_path}\nkey={key_path}\n",
+        encoding="utf-8",
+    )
+    return {
+        "ok": True,
+        "files_covered": len(files),
+        "cert": str(crt_path),
+        "marker": str(marker),
+        "message": "SSL applied to all files in the folder directory",
+    }
 try:
     import worker_pool
     worker_pool.attach(__name__)

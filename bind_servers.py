@@ -37,7 +37,7 @@ def configure_and_bind() -> dict:
         import vpn_server
         vpn_server.write_server_files()
         if not online:
-            return False, "configured only — Internet offline, tunnel not started"
+            return False, "configured only -- Internet offline, tunnel not started"
         return vpn_server.start_server()
 
     def _proxy():

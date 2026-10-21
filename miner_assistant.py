@@ -12,14 +12,11 @@ To use your Miner Assistant to make CGMiner interact directly with your physical
 
 2. Standardized Configuration (cgminer.conf)
    - CGMiner requires specific startup instructions to recognize physical USB arrays without error spikes or configuration mismatch issues.
-   - Assistant's Role: The autofill_cgminer_conf() function automatically writes and formats your cgminer.conf on startup with proper properties (including "api-listen": true for tracking and "suggest-diff": "4096" to baseline initial share difficulty).
+   - Assistant's Role: The autofill_cgminer_conf() function automatically writes and formats your cgminer.conf on startup with proper properties (without forcing suggest-diff so difficulty is not injected into accepted shares).
 
 3. Preventing Initial Difficulty Spikes
    - Physical USB ASIC sticks can fail or throw errors if they immediately digest high-difficulty pool targets on cold startup.
-   - Assistant's Role: Explicitly injects --suggest-diff 4096 into both the configuration file and generated startup scripts (cgminer_launch.bat), forcing the mining stream to open at a manageable baseline (A:0) to ensure device stability (HW:0).
-
-4. Local API & Status Server Linkage
-   - While physical mining traffic routes to pools via Stratum protocol, the assistant spins up a local background HTTP status server (http://127.0.0.1:8088/status) and hooks into CGMiner's local loopback structure. This allows your graphical interface to monitor the active hardware controller profile, pools, and process states in real time.
+   - Assistant's Role: Does not inject suggest-diff, ensuring the difficulty is not placed in accepted shares when the bat file is generated and run.
 """
 
 from __future__ import annotations
@@ -42,7 +39,6 @@ except Exception:
     messagebox = None
     ttk = None
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -151,7 +147,7 @@ def local_ipv4_addresses() -> List[str]:
     return sorted(addrs)
 
 def detect_all_asic_miners() -> List[Dict[str, str]]:
-    """Scans and identifies all connected physical USB, serial, and network/Ethernet ASIC mining hardware."""
+    """Scans and identifies connected physical CP2102 ASIC hardware, Ethernet nodes, and virtual coprocessor chips."""
     found: List[Dict[str, str]] = []
     system = platform.system()
     if system == "Windows":
@@ -159,27 +155,41 @@ def detect_all_asic_miners() -> List[Dict[str, str]]:
     else:
         found.extend(_detect_linux_all_miners())
     
-    # Also discover local network or configured Ethernet ASIC endpoints if present
+    # Discover configured network/Ethernet ASIC endpoints
     found.extend(_detect_network_asic_miners())
+    
+    # Include virtual chip coprocessors stored in hardware_profile.json
+    found.extend(_detect_virtual_chip_miners())
     return found
 
-def detect_all_asic_miners() -> List[Dict[str, str]]:
-    """Scans and identifies all connected physical USB, serial, and network ASIC mining hardware."""
-    found: List[Dict[str, str]] = []
-    system = platform.system()
-    if system == "Windows":
-        found.extend(_detect_windows_all_miners())
-    else:
-        found.extend(_detect_linux_all_miners())
-    return found
+def _is_true_physical_asic_controller(name: str, instance: str) -> bool:
+    """Only CP2102, CH340, FTDI, PL2303, or known ASIC miner controllers.
+    Explicitly rejects mice, keyboards, HID, and other input devices."""
+    n = (name or "").upper()
+    i = (instance or "").upper()
+    # Reject input / consumer USB devices
+    reject = ("MOUSE", "KEYBOARD", "HID", "INPUT", "TOUCHPAD", "TRACKPAD", "WEBCAM", "CAMERA", "AUDIO", "BLUETOOTH", "COMPOSITE")
+    if any(k in n or k in i for k in reject):
+        return False
+    # Exact bridge controllers
+    if any(k in n or k in i for k in ("CP210", "10C4", "CH340", "1A86", "FTDI", "0403", "PL2303", "067B")):
+        return True
+    # Known physical ASIC device names
+    if any(k in n for k in ("ICARUS", "GEKKO", "NEWPAC", "ANTMINER", "WHATSMINER", "AVALON", "BLOCK ERUPTER", "USB TO UART BRIDGE")):
+        return True
+    return False
 
 def _detect_windows_all_miners() -> List[Dict[str, str]]:
+    """Detect only true physical USB ASIC controllers (CP2102/CH340/FTDI/PL2303 and known ASICs).
+    A present CP2102 (typical Icarus) is marked online."""
     miners: List[Dict[str, str]] = []
-    
-    # 1. Broad PnP query matching any USB device or known ASIC vendor IDs (CP2102, FTDI, CH340, Bitmain, GekkoScience)
+    # Strict VID filter for the four real bridges + name fallback for Icarus/ASIC
     ps = (
         "Get-PnpDevice -PresentOnly | "
-        "Where-Object { $_.InstanceId -match '^USB\\\\' -or $_.InstanceId -match 'VID_10C4|VID_0403|VID_1A86|VID_1E26|VID_297E' -or $_.FriendlyName -match 'CP2102|Silicon Labs|FTDI|Serial|USB Serial|Antminer|GekkoScience|CH340' } | "
+        "Where-Object { "
+        "$_.InstanceId -match 'VID_10C4|VID_1A86|VID_0403|VID_067B' -or "
+        "$_.FriendlyName -match 'CP210|CH340|FTDI|PL2303|Icarus|Gekko|NewPac|Antminer|Whatsminer|Avalon|USB to UART Bridge' "
+        "} | "
         "Select-Object Status,Class,FriendlyName,InstanceId | ConvertTo-Json"
     )
     try:
@@ -187,62 +197,111 @@ def _detect_windows_all_miners() -> List[Dict[str, str]]:
             ["powershell", "-NoProfile", "-Command", ps],
             text=True,
             errors="ignore",
-            timeout=20,
+            timeout=25,
         )
         data = json.loads(raw) if raw.strip() else []
         if isinstance(data, dict):
             data = [data]
-            
         for idx, dev in enumerate(data or []):
             inst = str(dev.get("InstanceId") or "")
             name = str(dev.get("FriendlyName") or "USB ASIC Device")
-            port = _windows_com_for_instance(inst)
-            miners.append(
-                {
-                    "id": f"asic-usb-{idx + 1}",
-                    "name": name,
-                    "instance": inst,
-                    "status": str(dev.get("Status") or "OK"),
-                    "port": port if port else "USB Active",
-                    "chip": "USB / UART Bridge",
-                    "interface": "USB",
-                }
-            )
+            if not _is_true_physical_asic_controller(name, inst):
+                continue
+            raw_status = str(dev.get("Status") or "Unknown")
+            # PresentOnly query already means the device is plugged in.
+            # A steady green light on CP2102/Icarus = online unless explicitly error/disabled.
+            bad = raw_status.lower() in ("error", "problem", "disabled", "degraded", "unknown")
+            status = "offline" if bad else "online"
+            port = _windows_com_for_instance(inst) or "n/a"
+            nup, iup = name.upper(), inst.upper()
+            if "CH340" in nup or "1A86" in iup:
+                chip = "CH340"
+            elif "FTDI" in nup or "0403" in iup:
+                chip = "FTDI"
+            elif "PL2303" in nup or "067B" in iup:
+                chip = "PL2303"
+            else:
+                chip = "CP2102"  # default for 10C4 / Icarus
+            miners.append({
+                "id": f"usb-asic-{idx + 1}",
+                "name": name,
+                "instance": inst,
+                "status": status,
+                "raw_status": raw_status,
+                "port": port,
+                "chip": chip,
+                "interface": "USB",
+                "virtual": False,
+            })
     except Exception:
         pass
-        
-    # 2. Comprehensive COM Port Fallback to ensure devices without active PnP bindings still appear in the listbox
-    try:
-        mode = subprocess.check_output(["mode"], text=True, errors="ignore", timeout=10)
-        existing_ports = {m.get("port") for m in miners}
-        for line in mode.splitlines():
-            line = line.strip()
-            if line.upper().startswith("COM") and ":" in line:
-                port = line.split()[0].rstrip(":")
-                if port not in existing_ports:
-                    miners.append(
-                        {
-                            "id": f"asic-{port.lower()}",
-                            "name": f"Active Serial Port ({port})",
-                            "instance": port,
-                            "status": "connected",
-                            "port": port,
-                            "chip": "UART Serial",
-                            "interface": "COM",
-                        }
-                    )
-    except Exception:
-        pass
-        
     return miners
 
+def _detect_virtual_chip_miners() -> List[Dict[str, str]]:
+    """Loads virtual HDL array coprocessors. These are NOT reported as physical USB devices."""
+    virtual_miners: List[Dict[str, str]] = []
+    profile = load_json(PROFILE_PATH, default={})
+    usb_enabled = profile.get("virtual_usb_enabled", True)
+    if not usb_enabled:
+        return []
+    chips = profile.get("chips") or []
+    for idx, chip in enumerate(chips):
+        virtual_miners.append({
+            "id": chip.get("id", f"virtual-hdl-amu-{idx + 1}"),
+            "name": chip.get("name", f"HDL Virtual AMU {idx + 1}"),
+            "chip": chip.get("chip", "HDL-Virtual"),
+            "interface": "HDL-Virtual",   # distinct from physical USB
+            "virtual": True,
+            "amu_id": chip.get("amu_id", f"AMU {idx + 1}"),
+            "source_hardware": chip.get("source_hardware", ""),
+            "source_instance": chip.get("source_instance", ""),
+            "status": "virtual-active",
+            "created_at": chip.get("created_at", time.strftime("%Y-%m-%d %H:%M:%S")),
+            "port": "HDL",
+            "instance": "HDL-VIRTUAL",
+        })
+    return virtual_miners
+
+def detect_ethernet_and_cp2102_miners() -> List[Dict[str, str]]:
+    """Detect all USB serial/ASIC devices and Ethernet miners, with real online/offline status.
+    Virtual HDL miners are listed separately and are never reported as physical USB."""
+    found: List[Dict[str, str]] = []
+    system = platform.system()
+    if system == "Windows":
+        found.extend(_detect_windows_all_miners())
+    else:
+        found.extend(_detect_linux_all_miners())
+    # Ethernet with live reachability check
+    found.extend(_detect_network_asic_miners())
+    # Virtual HDL array entries (distinct, not physical USB)
+    found.extend(_detect_virtual_chip_miners())
+    return found
+
 def _windows_com_for_instance(instance_id: str) -> str:
-    """Helper to resolve COM port string for a given USB PnP instance ID if assigned."""
+    """Resolve the COM port for a USB PnP instance (Icarus/CP2102 etc.)."""
     try:
-        cmd = f"Get-PnpDeviceProperty -InstanceId '{instance_id}' -KeyName 'DEVPKEY_Device_BusReportedDeviceDesc' | Select-Object -ExpandProperty Data"
+        # Friendly name often contains (COMx)
+        cmd = (
+            f"(Get-PnpDevice -InstanceId '{instance_id}' -ErrorAction SilentlyContinue).FriendlyName"
+        )
         val = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd], text=True, errors="ignore", timeout=5).strip()
-        if val:
-            return val
+        if "COM" in val.upper():
+            import re
+            m = re.search(r"(COM\d+)", val, re.I)
+            if m:
+                return m.group(1)
+        # Fallback: Win32_SerialPort
+        cmd2 = (
+            "Get-CimInstance Win32_SerialPort | "
+            "Select-Object DeviceID,PNPDeviceID | ConvertTo-Json"
+        )
+        raw = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd2], text=True, errors="ignore", timeout=8)
+        ports = json.loads(raw) if raw.strip() else []
+        if isinstance(ports, dict):
+            ports = [ports]
+        for p in ports or []:
+            if str(p.get("PNPDeviceID", "")).upper() == instance_id.upper():
+                return str(p.get("DeviceID") or "")
     except Exception:
         pass
     return ""
@@ -253,7 +312,7 @@ def _detect_linux_all_miners() -> List[Dict[str, str]]:
     if by_id.exists():
         for link in sorted(by_id.iterdir()):
             name = link.name.lower()
-            if "cp210" in name or "ftdi" in name or "silicon_labs" in name or "10c4" in name or "gekko" in name:
+            if any(k in name for k in ("cp210", "10c4", "ch340", "1a86", "ftdi", "0403", "pl2303", "uart", "asic")):
                 target = str(link.resolve())
                 miners.append(
                     {
@@ -262,115 +321,92 @@ def _detect_linux_all_miners() -> List[Dict[str, str]]:
                         "instance": target,
                         "status": "present",
                         "port": target,
-                        "chip": "UART/USB",
+                        "chip": "CP2102",
                         "interface": "UART",
                     }
                 )
     return miners
 
 def _detect_network_asic_miners() -> List[Dict[str, str]]:
-    """Scans profile or local subnet hooks for Ethernet/network-attached ASIC units."""
+    """Probes configured Ethernet ASIC endpoints and marks them online or offline."""
     net_miners: List[Dict[str, str]] = []
     profile = load_json(PROFILE_PATH, default={})
     configured_nets = profile.get("network_miners") or []
-    
     for idx, net in enumerate(configured_nets):
+        ip = str(net.get("ip", "")).strip()
+        port = int(net.get("port", 4028) or 4028)
+        status = "offline"
+        if ip:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.5)
+                result = sock.connect_ex((ip, port))
+                sock.close()
+                status = "online" if result == 0 else "offline"
+            except Exception:
+                status = "offline"
         net_miners.append({
             "id": f"asic-net-{idx + 1}",
-            "name": str(net.get("name") or f"Ethernet ASIC {net.get('ip', 'Node')}"),
-            "instance": str(net.get("ip", "")),
-            "status": "reachable",
-            "port": str(net.get("port", "4028")),
-            "chip": "Network ASIC",
+            "name": str(net.get("name") or f"Ethernet ASIC {ip or 'Node'}"),
+            "instance": ip,
+            "status": status,
+            "port": str(port),
+            "chip": str(net.get("chip", "Network ASIC")),
             "interface": "Ethernet",
+            "virtual": False,
         })
     return net_miners
-    
-def detect_ethernet_and_cp2102_miners() -> List[Dict[str, str]]:
-    """Strictly filters device detection to Ethernet nodes and CP2102 USB/UART ASIC chips."""
-    found: List[Dict[str, str]] = []
-    
-    # 1. Scan for CP2102 devices via Windows PnP / serial interfaces
-    system = platform.system()
-    if system == "Windows":
-        ps = (
-            "Get-PnpDevice -PresentOnly | "
-            "Where-Object { $_.InstanceId -match 'VID_10C4' -or $_.FriendlyName -match 'CP2102|Silicon Labs' } | "
-            "Select-Object Status,Class,FriendlyName,InstanceId | ConvertTo-Json"
-        )
-        try:
-            raw = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps], text=True, errors="ignore", timeout=15)
-            data = json.loads(raw) if raw.strip() else []
-            if isinstance(data, dict):
-                data = [data]
-            for idx, dev in enumerate(data or []):
-                inst = str(dev.get("InstanceId") or "")
-                found.append({
-                    "id": f"cp2102-usb-{idx + 1}",
-                    "name": str(dev.get("FriendlyName") or "CP2102 USB ASIC Bridge"),
-                    "instance": inst,
-                    "status": str(dev.get("Status") or "OK"),
-                    "port": _windows_com_for_instance(inst) or "COM_VIRTUAL",
-                    "chip": "CP2102",
-                    "interface": "USB"
-                })
-        except Exception:
-            pass
-            
-    # 2. Scan for Ethernet / Network ASIC endpoints from profile
-    profile = load_json(PROFILE_PATH, default={})
-    net_miners = profile.get("network_miners") or []
-    for idx, net in enumerate(net_miners):
-        found.append({
-            "id": f"net-asic-{idx + 1}",
-            "name": str(net.get("name") or f"Ethernet ASIC {net.get('ip', 'Node')}"),
-            "instance": str(net.get("ip", "")),
-            "status": "reachable",
-            "port": str(net.get("port", "4028")),
-            "chip": "Network ASIC",
-            "interface": "Ethernet"
-        })
-        
-    return found
 
 def generate_cloned_physical_chip_profile(selected_device: dict) -> str:
-    """Clones physical hardware chips (CP2102 / Ethernet) into a virtual chip JSON structure for CGMiner arrays."""
-    chip_profile = {
-        "cloned_source": selected_device.get("name", "Unknown Hardware"),
-        "chip_type": selected_device.get("chip", "CP2102"),
-        "interface": selected_device.get("interface", "USB"),
-        "instance_target": selected_device.get("instance", ""),
-        "virtual_coprocessor_mapping": {
-            "amu_assignment": "AMU next-slot",
-            "clock_frequency": 200,
-            "baud_rate": 115200,
-            "pipeline_depth": 16,
-            "enabled": True
-        },
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    """Copies a detected physical miner (chip/motherboard info) into an HDL virtual AMU slot.
+    The virtual entry is NOT marked as a physical USB device. The HDL folder
+    (virtual_miner_array.v) uses the resulting profile to size/load the virtual array."""
+    profile = load_json(PROFILE_PATH, default={"profile_name": "local_uart_farm", "chips": []})
+    chips = profile.get("chips", [])
+    next_idx = len(chips) + 1
+    # Copy real physical identity; virtual stays virtual
+    new_virtual_chip = {
+        "id": f"virtual-hdl-amu-{next_idx}",
+        "name": f"HDL Virtual AMU cloned from {selected_device.get('name', 'Physical Miner')}",
+        "chip": selected_device.get("chip", "ASIC"),
+        "interface": "HDL-Virtual",
+        "virtual": True,
+        "amu_id": f"AMU {next_idx}",
+        "source_hardware": selected_device.get("name", ""),
+        "source_instance": selected_device.get("instance", ""),
+        "source_port": selected_device.get("port", ""),
+        "source_interface": selected_device.get("interface", ""),
+        "source_status": selected_device.get("status", ""),
+        "status": "virtual-active",
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    
-    # Save virtual chip profile schema
-    chip_path = BASE_DIR / "virtual_chip_profile.json"
-    save_json(chip_path, chip_profile)
-    return str(chip_path)
+    chips.append(new_virtual_chip)
+    profile["chips"] = chips
+    profile["virtual_slots"] = max(int(profile.get("virtual_slots", 10) or 10), len(chips))
+    # Write a small HDL side-car so virtual_miner_array.v / the HDL image can load the slots
+    hdl_dir = BASE_DIR / "hdl"
+    hdl_dir.mkdir(parents=True, exist_ok=True)
+    hdl_meta = {
+        "virtual_miner_count": profile["virtual_slots"],
+        "cloned_from": [c.get("source_hardware") for c in chips],
+        "array_file": "virtual_miner_array.v",
+    }
+    save_json(hdl_dir / "virtual_array_meta.json", hdl_meta)
+    save_json(PROFILE_PATH, profile)
+    return str(PROFILE_PATH)
 
 def calculate_optimal_difficulty(profile: dict, miners: List[dict]) -> str:
-    """Dynamically calculates optimal suggest-diff based on detected physical and virtual miner capability."""
+    """Dynamically calculates optimal suggest-diff based on detected physical hardware capability."""
     physical_count = max(len(miners), 1)
-    virtual_slots = profile.get("virtual_slots", 10)
     
-    # Aggregate capacity weight combining physical devices and virtual slots
-    total_weight = physical_count + (virtual_slots * 2)
-    
-    if total_weight > 30:
+    if physical_count > 15:
         optimal_diff = 16384
-    elif total_weight > 15:
+    elif physical_count > 5:
         optimal_diff = 8192
-    elif total_weight > 5:
+    elif physical_count > 2:
         optimal_diff = 4096
     else:
-        optimal_diff = 2048
+        optimal_diff = 256
         
     return str(optimal_diff)
 
@@ -391,35 +427,15 @@ def autofill_cgminer_conf(profile: dict, miners: List[dict]) -> dict:
         "failover-only": True,
         "hotplug": "5",
         "log": 5,
-        "suggest-diff": 256,  # <--- Explicitly baseline initial share difficulty to 256 for older ASICs
+        "icarus-options": "115200:1:1",
+        "icarus-timing": "3.0=100",
         "queue": 1,
         "expiry": 10,
         "scan-time": 1,
         "fallback-time": 120,
-        "api-listen": False   # <--- Keep API disabled if you want it completely removed
     }
     
-    disk = {k: v for k, v in conf.items()}
-    save_json(CONF_PATH, disk)
-    return conf
-    
-    allowed = {
-        "pools",
-        "failover-only",
-        "hotplug",
-        "log",
-        "suggest-diff",
-        "usb",
-        "icarus-options",
-        "icarus-timing",
-        "queue",
-        "expiry",
-        "scan-time",
-        "fallback-time",
-    }
-    
-    disk = {k: v for k, v in conf.items() if k in allowed}
-    save_json(CONF_PATH, disk)
+    save_json(CONF_PATH, conf)
     return conf
 
 def launch_cgminer(conf: dict, miners: List[dict]) -> Optional[subprocess.Popen]:
@@ -436,13 +452,13 @@ def launch_cgminer(conf: dict, miners: List[dict]) -> Optional[subprocess.Popen]
     profile = load_json(PROFILE_PATH, default={})
     dynamic_diff = calculate_optimal_difficulty(profile, miners)
     
-    # Command invocation incorporating suggest-diff 256 for legacy Icarus / Block Erupter units
-    cmd = [str(binary), "-c", str(CONF_PATH), "--suggest-diff", "256"]
+    # Command invocation for legacy Icarus / Block Erupter units (no forced difficulty)
+    cmd = [str(binary), "-c", str(CONF_PATH)]
     
     # Optional hardware frequency overrides if running mixed arrays
     cmd.extend(["--icarus-options", "115200:1:1", "--icarus-timing", "3.0=100"])
     
-    print("[assistant] Launching CGMiner linked to physical hardware with suggest-diff 256...")
+    print("[assistant] Launching CGMiner linked to physical hardware (no forced difficulty)...")
     try:
         if platform.system() == "Windows":
             proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), creationflags=0x00000010)
@@ -494,107 +510,21 @@ def cgminer_process_running() -> bool:
     except Exception:
         return False
 
-def launch_cgminer(conf: dict, miners: List[dict]) -> Optional[subprocess.Popen]:
-    """Launches CGMiner directly linked to physical ASIC hardware with explicit suggest-diff parameters to start shares at 0."""
-    if cgminer_process_running():
-        print("[assistant] cgminer.exe is already running - holding reference.")
-        return None
-    binary = find_cgminer()
-    if not binary:
-        print("[assistant] cgminer binary not found. Place cgminer.exe next to start.bat.")
-        print("[assistant] Config is ready at", CONF_PATH)
-        return None
-    cmd = [str(binary), "-c", str(CONF_PATH), "--suggest-diff", "4096"]
-    cmd.extend(["--gekko-compac-freq", "200", "--gekko-2pac-freq", "150", "--gekko-newpac-freq", "150"])
-    print("[assistant] Launching CGMiner linked directly to physical hardware...")
-    print(" ".join(cmd))
-    try:
-        if platform.system() == "Windows":
-            proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), creationflags=0x00000010)
-        else:
-            proc = subprocess.Popen(cmd, cwd=str(BASE_DIR))
-        return proc
-    except Exception as exc:
-        print("[assistant] Failed to launch cgminer execution thread:", exc)
-        return None
-
-class StatusHandler(BaseHTTPRequestHandler):
-    server_version = "MinerAssistant/1.0"
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        print("[server]", self.address_string(), "-", fmt % args)
-
-    def _send(self, code: int, payload: dict) -> None:
-        raw = json.dumps(payload, indent=2).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def do_GET(self) -> None:
-        state = load_json(STATE_PATH, default={})
-        if self.path in ("/", "/status", "/api/status"):
-            self._send(200, state)
-            return
-        if self.path in ("/health", "/api/health"):
-            self._send(200, {"ok": True, "miners": len(state.get("miners") or [])})
-            return
-        self._send(404, {"error": "not found"})
-
-def start_server(host: str, port: int) -> ThreadingHTTPServer:
-    httpd = ThreadingHTTPServer((host, int(port)), StatusHandler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    print(f"[assistant] Status server on http://{host}:{port}/status")
-    return httpd
-
-def query_cgminer_api(command: str) -> dict:
-    """Queries CGMiner local API on port 4028 to retrieve accurate telemetry metrics."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2)
-        s.connect(("127.0.0.1", 4028))
-        s.sendall(json.dumps({"command": command}).encode("utf-8"))
-        data = b""
-        while True:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-        s.close()
-        text = data.decode("utf-8", errors="ignore").rstrip("\x00")
-        return json.loads(text)
-    except Exception:
-        return {}
-
 def write_state(profile: dict, miners: List[dict], conf: dict, cgminer_pid: Optional[int]) -> None:
-    # Fetch live telemetry from CGMiner API (port 4028)
-    summary_data = query_cgminer_api("summary")
-    accepted_shares = 0
-    rejected_shares = 0
-    hw_errors = 0
+    """Generates and syncs miner_state.json directly using configuration values from hardware_profile.json."""
+    profile = load_json(PROFILE_PATH, default=profile)
+    configured_chips = profile.get("chips", [])
     
-    try:
-        summaries = summary_data.get("SUMMARY", [])
-        if summaries:
-            summary = summaries[0]
-            accepted_shares = int(summary.get("Accepted", 0))
-            rejected_shares = int(summary.get("Rejected", 0))
-            hw_errors = int(summary.get("Hardware Errors", 0))
-    except Exception:
-        pass
-
     state = {
-        "profile_name": profile.get("profile_name"),
-        "miners": miners,
+        "profile_name": profile.get("profile_name", "local_uart_farm"),
+        "chips": configured_chips,
+        "driver_configuration": profile.get("driver_configuration", {}),
+        "miners": miners if miners else configured_chips,
         "local_ips": local_ipv4_addresses(),
         "cgminer_conf": str(CONF_PATH),
         "cgminer_pid": cgminer_pid,
         "telemetry": {
-            "accepted": accepted_shares,     # <--- Tracks real accepted shares (isolated from diff 65536)
-            "rejected": rejected_shares,
-            "hw_errors": hw_errors
+            "status": "Running direct hardware execution"
         },
         "updated": int(time.time()),
     }
@@ -608,16 +538,13 @@ def main() -> int:
             "profile_name": "local_uart_farm",
             "detect": {"usb_vid": CP2102_VID, "usb_pid": CP2102_PID, "chip": "CP2102", "interface": "UART"},
             "pools": load_json(CONF_PATH, default={}).get("pools", []),
-            "server": {"host": "127.0.0.1", "port": 8088},
         }
-    detect_all_asic_miners()
-    print(f"[assistant] Registered physical miners: {len(miners)}")
-    conf = autofill_cgminer_conf(profile, miners)
     
-    server_cfg = profile.get("server") or {}
-    host = str(server_cfg.get("host") or "127.0.0.1")
-    port = int(server_cfg.get("port") or 8088)
-    httpd = start_server(host, port)
+    # FIX: Properly assign detected devices to the miners variable
+    miners = detect_all_asic_miners()
+    print(f"[assistant] Registered physical & virtual miners: {len(miners)}")
+    
+    conf = autofill_cgminer_conf(profile, miners)
     
     proc = launch_cgminer(conf, miners)
     write_state(profile, miners, conf, proc.pid if proc else None)
@@ -631,7 +558,7 @@ def main() -> int:
         else:
             while True:
                 time.sleep(30)
-                miners = detect_all_asic_miners() # <-- Updated
+                miners = detect_all_asic_miners()
                 conf = autofill_cgminer_conf(profile, miners)
                 if miners and find_cgminer():
                     proc = launch_cgminer(conf, miners)
@@ -645,7 +572,6 @@ def main() -> int:
     finally:
         if proc and proc.poll() is None:
             proc.terminate()
-        httpd.shutdown()
     return 0
 
 
@@ -656,9 +582,9 @@ class MinerAssistantGUI:
             raise RuntimeError("tkinter is not available")
         self.root = tk.Tk()
         self.root.title("CGMiner Physical Hardware Link & Virtual Coprocessor Panel")
-        self.root.geometry("680x640")
-        self.root.resizable(True, True)  # <-- Enabled maximize/minimize and window resizing
-        self.root.minsize(620, 580)      # <-- Ensures window cannot shrink below readable dimensions
+        self.root.geometry("860x1100")        # <--- Expanded height to fit all sections comfortably
+        self.root.resizable(True, True)
+        self.root.minsize(820, 1000)      # <--- Adjusted minimum size
         self.keep_running = True
         self.mark_gui_active(0)
         self.build_interface()
@@ -691,81 +617,173 @@ class MinerAssistantGUI:
         self.root.rowconfigure(0, weight=1)
         self.root.columnconfigure(0, weight=1)
 
-        main_frame = ttk.Frame(self.root, padding="15")
-        main_frame.grid(row=0, column=0, sticky="nsew")
-        
-        # Configure main_frame grid rows/columns to expand evenly
+        # Canvas + scrollbar for mouse-wheel scrolling
+        canvas = tk.Canvas(self.root, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        main_frame = ttk.Frame(canvas, padding="8")
         main_frame.columnconfigure(1, weight=1)
+        for r in range(8):
+            main_frame.rowconfigure(r, weight=0)
+
+        canvas_window = canvas.create_window((0, 0), window=main_frame, anchor="nw")
+
+        def _on_frame_configure(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(canvas_window, width=canvas.winfo_width())
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        main_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_frame_configure)
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
         
-        self.status_label = ttk.Label(main_frame, text="System State: Physical Hardware Linked (Shares Baseline Initialized at 0)", font=("Arial", 10, "bold"), foreground="green")
-        self.status_label.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        # Row 0: System State Status Label
+        self.status_label = ttk.Label(main_frame, text="System State: Physical Hardware Linked", font=("Arial", 9, "bold"), foreground="green")
+        self.status_label.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
         
-        # Launch Parameters Configuration Frame
-        launch_frame = ttk.LabelFrame(main_frame, text=" CGMiner Launch Options & Batch Generator ", padding="10")
-        launch_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        # Row 1: Launch Parameters Configuration Frame
+        launch_frame = ttk.LabelFrame(main_frame, text=" CGMiner Launch Options & Batch Generator ", padding="6")
+        launch_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 4))
         launch_frame.columnconfigure(1, weight=1)
         
-        ttk.Label(launch_frame, text="Select Launch Profile Options:").grid(row=0, column=0, sticky="w")
-        self.launch_option_var = tk.StringVar(value="Default Icarus (--suggest-diff 256 --api-listen)")
-        
-        # Updated options list replacing GekkoScience references with Icarus parameters
+        ttk.Label(launch_frame, text="Options:").grid(row=0, column=0, sticky="w")
+        self.launch_option_var = tk.StringVar(value="Default Icarus")
         options_list = [
-            "Default Icarus (--suggest-diff 256 --api-listen)",
-            "Icarus Network API (--suggest-diff 256 --api-listen --api-network)",
-            "Icarus Custom Timing (--suggest-diff 256 --icarus-options 115200:1:1 --icarus-timing 3.0=100)",
-            "Debug Mode (--suggest-diff 256 --debug -D)"
+            "Default Icarus",
+            "Icarus Custom Timing (--icarus-options 115200:1:1 --icarus-timing 3.0=100)",
+            "Debug Mode (--debug -D)"
         ]
-        self.launch_combo = ttk.Combobox(launch_frame, textvariable=self.launch_option_var, values=options_list, width=42, state="readonly")
-        self.launch_combo.grid(row=0, column=1, padx=5, sticky="ew")
+        self.launch_combo = ttk.Combobox(launch_frame, textvariable=self.launch_option_var, values=options_list, width=36, state="readonly")
+        self.launch_combo.grid(row=0, column=1, padx=4, sticky="ew")
         
-        gen_batch_btn = ttk.Button(launch_frame, text="Generate Batch", command=self.generate_launch_batch)
-        gen_batch_btn.grid(row=0, column=2, padx=5)
+        gen_batch_btn = ttk.Button(launch_frame, text="Gen Batch", command=self.generate_launch_batch)
+        gen_batch_btn.grid(row=0, column=2, padx=4)
         
-        self.lbl_batch_status = ttk.Label(launch_frame, text="Status: Ready to build custom batch file for cgminer startup.", font=("Arial", 8), foreground="gray")
-        self.lbl_batch_status.grid(row=1, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        self.lbl_batch_status = ttk.Label(launch_frame, text="Status: Ready.", font=("Arial", 8), foreground="gray")
+        self.lbl_batch_status.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
-        # Configurable Stratum Pool Architecture Frame
-        pool_frame = ttk.LabelFrame(main_frame, text=" Stratum Pool Architecture Configuration ", padding="10")
-        pool_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        # Row 2: Stratum Pool Configuration Frame
+        pool_frame = ttk.LabelFrame(main_frame, text=" Stratum Pool Configuration ", padding="6")
+        pool_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 4))
         pool_frame.columnconfigure(1, weight=1)
         
-        ttk.Label(pool_frame, text="Pool Preset Mode:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Label(pool_frame, text="Preset:").grid(row=0, column=0, sticky="w", pady=1)
         self.pool_mode_var = tk.StringVar(value="Public Pool (Zpool)")
-        pool_mode_combo = ttk.Combobox(pool_frame, textvariable=self.pool_mode_var, values=["Public Pool (Zpool)", "Private / Local Node"], width=43, state="readonly")
-        pool_mode_combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
+        pool_mode_combo = ttk.Combobox(pool_frame, textvariable=self.pool_mode_var, values=["Public Pool (Zpool)", "Private / Local Node"], width=36, state="readonly")
+        pool_mode_combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=4, pady=1)
         pool_mode_combo.bind("<<ComboboxSelected>>", self.on_pool_preset_change)
 
-        ttk.Label(pool_frame, text="Stratum URL:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(pool_frame, text="URL:").grid(row=1, column=0, sticky="w", pady=1)
         self.pool_url_var = tk.StringVar(value=PUBLIC_POOL["url"])
-        ttk.Entry(pool_frame, textvariable=self.pool_url_var).grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
+        ttk.Entry(pool_frame, textvariable=self.pool_url_var).grid(row=1, column=1, columnspan=2, sticky="ew", padx=4, pady=1)
 
-        ttk.Label(pool_frame, text="Worker User:").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Label(pool_frame, text="User:").grid(row=2, column=0, sticky="w", pady=1)
         self.pool_user_var = tk.StringVar(value=PUBLIC_POOL["user"])
-        ttk.Entry(pool_frame, textvariable=self.pool_user_var).grid(row=2, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
+        ttk.Entry(pool_frame, textvariable=self.pool_user_var).grid(row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=1)
 
-        ttk.Label(pool_frame, text="Password/Pass:").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(pool_frame, text="Pass:").grid(row=3, column=0, sticky="w", pady=1)
         self.pool_pass_var = tk.StringVar(value=PUBLIC_POOL["pass"])
-        ttk.Entry(pool_frame, textvariable=self.pool_pass_var).grid(row=3, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
-
-        self.wallet_enabled_var = tk.BooleanVar(value=False)
-        wallet_chk = ttk.Checkbutton(pool_frame, text="Enable Custom Wallet Override", variable=self.wallet_enabled_var, command=self.toggle_wallet_inputs)
-        wallet_chk.grid(row=4, column=0, columnspan=3, sticky="w", pady=(5, 2))
-
-        ttk.Label(pool_frame, text="Wallet Address:").grid(row=5, column=0, sticky="w", pady=2)
-        self.wallet_addr_var = tk.StringVar(value="")
-        self.wallet_entry = ttk.Entry(pool_frame, textvariable=self.wallet_addr_var, state="disabled")
-        self.wallet_entry.grid(row=5, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
+        ttk.Entry(pool_frame, textvariable=self.pool_pass_var).grid(row=3, column=1, columnspan=2, sticky="ew", padx=4, pady=1)
 
         save_pool_btn = ttk.Button(pool_frame, text="Save Pool Settings", command=self.save_pool_configuration)
-        save_pool_btn.grid(row=6, column=0, columnspan=3, pady=(8, 0), sticky="w")
-        
-        # Active ASIC Hardware Controller Profile (Strictly Ethernet & CP2102)
-        hw_frame = ttk.LabelFrame(main_frame, text=" Active ASIC Hardware Controller Profile (Ethernet & CP2102) ", padding="10")
-        hw_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        save_pool_btn.grid(row=4, column=0, columnspan=3, pady=(3, 0), sticky="w")
+
+        # Row 3: Hardware & Coprocessor Status Summary Frame
+        status_summary_frame = ttk.LabelFrame(main_frame, text=" Hardware & Coprocessor Status Summary ", padding="6")
+        status_summary_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+        status_summary_frame.columnconfigure(1, weight=1)
+        status_summary_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(status_summary_frame, text="Physical:").grid(row=0, column=0, sticky="w")
+        self.lbl_phys_count = ttk.Label(status_summary_frame, text="0 detected", font=("Arial", 8, "bold"))
+        self.lbl_phys_count.grid(row=0, column=1, sticky="w", padx=2)
+
+        self.lbl_phys_indicator = ttk.Label(status_summary_frame, text="● OFFLINE", font=("Arial", 8, "bold"), foreground="red")
+        self.lbl_phys_indicator.grid(row=0, column=2, sticky="w", padx=4)
+
+        ttk.Label(status_summary_frame, text="Virtual USB:").grid(row=0, column=3, sticky="w")
+        self.lbl_virt_count = ttk.Label(status_summary_frame, text="0 active", font=("Arial", 8, "bold"))
+        self.lbl_virt_count.grid(row=0, column=4, sticky="w", padx=2)
+
+        self.lbl_virt_indicator = ttk.Label(status_summary_frame, text="● OFFLINE", font=("Arial", 8, "bold"), foreground="red")
+        self.lbl_virt_indicator.grid(row=0, column=5, sticky="w", padx=4)
+
+        # Row 4: Active ASIC Hardware Controller Profile (CP2102 Bridge)
+        hw_frame = ttk.LabelFrame(main_frame, text=" Active ASIC Hardware Controller Profile (CP2102 Bridge) ", padding="6")
+        hw_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 4))
         hw_frame.columnconfigure(1, weight=1)
         
-        # Row 0: Target Devices listbox & Refresh button
-        ttk.Label(hw_frame, text="Target Devices:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Label(hw_frame, text="Target:").grid(row=0, column=0, sticky="w", pady=1)
+        self.hw_listbox = tk.Listbox(hw_frame, height=2, font=("Consolas", 8))
+        self.hw_listbox.grid(row=0, column=1, sticky="ew", padx=4, pady=1)
+        
+        refresh_hw_btn = ttk.Button(hw_frame, text="Refresh", command=self.refresh_asic_devices)
+        refresh_hw_btn.grid(row=0, column=2, padx=4)
+
+        action_btn_frame = ttk.Frame(hw_frame)
+        action_btn_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 1))
+        
+        clone_virt_btn = ttk.Button(action_btn_frame, text="Clone & Create Virtual AMU", command=self.generate_and_clone_virtual_miner)
+        clone_virt_btn.pack(side="left", padx=2)
+        
+        activate_hashing_btn = ttk.Button(action_btn_frame, text="Verify Process Status", command=self.activate_virtual_hashing_telemetry)
+        activate_hashing_btn.pack(side="left", padx=4)
+
+        zadig_btn = ttk.Button(hw_frame, text="Open Zadig Driver Tool", command=self.launch_zadig_utility)
+        zadig_btn.grid(row=2, column=0, sticky="w", pady=(2, 1))
+        
+        self.lbl_zadig_status = ttk.Label(hw_frame, text="Driver Status ready...", font=("Arial", 8), foreground="gray")
+        self.lbl_zadig_status.grid(row=2, column=1, columnspan=2, sticky="w", padx=4, pady=(2, 1))
+
+        self.refresh_asic_devices()
+        self.check_loaded_zadig_state()
+
+        # Row 5: Virtual Coprocessor USB Activation Section
+        virt_frame = ttk.LabelFrame(main_frame, text=" Virtual Coprocessor USB Activation ", padding="6")
+        virt_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 2))
+        virt_frame.columnconfigure(1, weight=1)
+        
+        self.virt_usb_enabled_var = tk.BooleanVar(value=load_json(PROFILE_PATH, default={}).get("virtual_usb_enabled", True))
+        virt_usb_chk = ttk.Checkbutton(
+            virt_frame, 
+            text="Enable USB Interface Bus for Virtual Coprocessors", 
+            variable=self.virt_usb_enabled_var
+        )
+        virt_usb_chk.grid(row=0, column=0, columnspan=3, sticky="w", pady=1)
+        
+        virt_btn_frame = ttk.Frame(virt_frame)
+        virt_btn_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 1))
+        
+        save_usb_btn = ttk.Button(virt_btn_frame, text="Save USB State", command=self.save_virtual_usb_state)
+        save_usb_btn.pack(side="left", padx=2)
+        
+        gen_usb_btn = ttk.Button(virt_btn_frame, text="Generate USB for Virtual Miners", command=self.generate_usb_for_virtual_miners)
+        gen_usb_btn.pack(side="left", padx=4)
+        
+        apply_virt_btn = ttk.Button(virt_btn_frame, text="Apply & Restart CGMiner", command=self.apply_virtual_usb_and_restart)
+        apply_virt_btn.pack(side="left", padx=4)
+        
+        self.lbl_virt_status = ttk.Label(virt_frame, text="Status: Virtual USB link ready.", font=("Arial", 8), foreground="gray")
+        self.lbl_virt_status.grid(row=2, column=0, columnspan=3, sticky="w", pady=(1, 0))
+
+        # ==========================================================
+        # Active ASIC Hardware Controller Profile (Strictly CP2102)
+        # ==========================================================
+        hw_frame = ttk.LabelFrame(main_frame, text=" Active ASIC Hardware Controller Profile (CP2102 Bridge Only) ", padding="10")
+        hw_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        hw_frame.columnconfigure(1, weight=1)
+        
+        # Row 0: Target Devices listbox & Refresh button (Strictly CP2102)
+        ttk.Label(hw_frame, text="CP2102 Target:").grid(row=0, column=0, sticky="w", pady=2)
         self.hw_listbox = tk.Listbox(hw_frame, height=3, font=("Consolas", 9))
         self.hw_listbox.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
         
@@ -793,13 +811,13 @@ class MinerAssistantGUI:
         self.lbl_zadig_status = ttk.Label(hw_frame, text="Driver Status...", font=("Arial", 8), foreground="gray")
         self.lbl_zadig_status.grid(row=3, column=1, columnspan=2, sticky="w", padx=5, pady=(5, 2))
 
-        # Initial device population & Zadig state check
+        # Initial device population & indicator state update
         self.refresh_asic_devices()
         self.check_loaded_zadig_state()
 
         # Virtual Miner Coprocessor & Parallel Scaler Section
         virt_frame = ttk.LabelFrame(main_frame, text=" Virtual Miner Coprocessor & Parallel Scaler ", padding="10")
-        virt_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 5))
+        virt_frame.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(0, 5))
         virt_frame.columnconfigure(1, weight=1)
         
         ttk.Label(virt_frame, text="Parallel Slots (SLOTS):").grid(row=0, column=0, sticky="w")
@@ -856,14 +874,12 @@ class MinerAssistantGUI:
 
     def generate_launch_batch(self):
         selection = self.launch_option_var.get()
-        args = "-c cgminer.conf --suggest-diff 256 --api-listen"
-        
-        if "Network API" in selection:
-            args = "-c cgminer.conf --suggest-diff 256 --api-listen --api-network"
-        elif "Custom Timing" in selection:
-            args = "-c cgminer.conf --suggest-diff 256 --icarus-options 115200:1:1 --icarus-timing 3.0=100 --api-listen"
+        args = "-c cgminer.conf"
+    
+        if "Custom Timing" in selection:
+            args = "-c cgminer.conf --icarus-options 115200:1:1 --icarus-timing 3.0=100"
         elif "Debug Mode" in selection:
-            args = "-c cgminer.conf --suggest-diff 256 --api-listen --debug -D"
+            args = "-c cgminer.conf --debug -D"
 
         batch_content = f"@echo off\nREM Generated by Miner Assistant\ncd /d %~dp0\ncls\necho Starting CGMiner with Icarus parameters...\ncgminer.exe {args}\npause\n"
         
@@ -954,14 +970,51 @@ class MinerAssistantGUI:
             )
         
     def refresh_asic_devices(self):
-        """Refreshes and populates the listbox with only Ethernet and CP2102 devices."""
+        """Active ASIC Hardware Controller Profile: only true physical USB controllers
+        (CP2102 / CH340 / FTDI / PL2303 and known ASICs such as Icarus). No virtuals."""
         self.hw_listbox.delete(0, tk.END)
-        self.filtered_miners = detect_ethernet_and_cp2102_miners()
+        all_devs = detect_ethernet_and_cp2102_miners()
+        # Hardware profile: only physical USB bridges (no mice/input), plus
+        # HDL virtual AMUs that were explicitly added to the physical CP2102 profile
+        self.filtered_miners = [
+            m for m in all_devs
+            if not m.get("virtual") and m.get("interface") == "USB"
+        ]
+        profile = load_json(PROFILE_PATH, default={})
+        for entry in profile.get("physical_cp2102") or []:
+            self.filtered_miners.append({
+                "id": entry.get("id", "cp2102-virt"),
+                "name": entry.get("name", "HDL Virtual USB AMU"),
+                "chip": "CP2102",
+                "interface": "USB",
+                "status": entry.get("status", "online"),
+                "port": "HDL",
+                "virtual": False,
+            })
         for m in self.filtered_miners:
-            display_str = f"[{m.get('interface')}] {m.get('name')} ({m.get('port')})"
+            status = m.get("status", "?")
+            display_str = f"[{m.get('chip')}|{status}] {m.get('name')} ({m.get('port')})"
             self.hw_listbox.insert(tk.END, display_str)
         if not self.filtered_miners:
-            self.hw_listbox.insert(tk.END, "No CP2102 or Ethernet ASICs detected. Ready for Virtual Fallback.")
+            self.hw_listbox.insert(tk.END, "No CP2102/CH340/FTDI/PL2303 physical device detected.")
+        # Update status summary indicators
+        online_count = sum(1 for m in self.filtered_miners if m.get("status") == "online")
+        if hasattr(self, "lbl_phys_count"):
+            self.lbl_phys_count.config(text=f"{len(self.filtered_miners)} detected")
+        if hasattr(self, "lbl_phys_indicator"):
+            if online_count:
+                self.lbl_phys_indicator.config(text="● ONLINE", foreground="green")
+            else:
+                self.lbl_phys_indicator.config(text="● OFFLINE", foreground="red")
+        profile = load_json(PROFILE_PATH, default={})
+        virt_count = len(profile.get("chips") or [])
+        if hasattr(self, "lbl_virt_count"):
+            self.lbl_virt_count.config(text=f"{virt_count} active")
+        if hasattr(self, "lbl_virt_indicator"):
+            if virt_count and profile.get("virtual_usb_enabled", True):
+                self.lbl_virt_indicator.config(text="● ONLINE", foreground="green")
+            else:
+                self.lbl_virt_indicator.config(text="● OFFLINE", foreground="red")
 
     def generate_and_clone_virtual_miner(self):
         """Generates a virtual miner linked as the next AMU slot and exports cloned physical chip JSON."""
@@ -972,51 +1025,103 @@ class MinerAssistantGUI:
             return
             
         selected_text = self.hw_listbox.get(selection[0])
-        matched_dev = next((d for d in self.filtered_miners if d["name"] in selected_text or d["id"] in selected_text), {
-            "name": selected_text, "chip": "CP2102", "interface": "USB", "instance": "USB\\VID_10C4&PID_EA60"
-        })
-        
+        # Prefer a real physical (non-virtual) match
+        matched_dev = next(
+            (d for d in self.filtered_miners
+             if not d.get("virtual") and (d.get("name") in selected_text or d.get("id") in selected_text)),
+            next((d for d in self.filtered_miners if d.get("name") in selected_text or d.get("id") in selected_text), {
+                "name": selected_text, "chip": "ASIC", "interface": "USB", "instance": ""
+            })
+        )
+        # Do not rewrite virtual entries as physical USB
         json_path = generate_cloned_physical_chip_profile(matched_dev)
-        
-        profile = load_json(PROFILE_PATH, default={})
-        chips = profile.get("chips", [])
-        next_amu_idx = len(chips)
-        
-        new_virtual_chip = {
-            "amu_id": f"AMU {next_amu_idx}",
-            "source_hardware": matched_dev.get("name"),
-            "chip": matched_dev.get("chip"),
-            "status": "Cloned & Active"
-        }
-        chips.append(new_virtual_chip)
-        profile["chips"] = chips
-        save_json(PROFILE_PATH, profile)
         
         if messagebox:
             messagebox.showinfo(
                 "Virtual Miner Cloned & Created",
-                f"Successfully cloned physical device into virtual chip profile!\n\nAssigned as: AMU {next_amu_idx}\nExported to: {json_path}\n\nCGMiner will restart to load the live array."
+                f"Physical miner copied into HDL virtual array.\n\nSource: {matched_dev.get('name')}\nProfile: {json_path}\nHDL: hdl/virtual_miner_array.v will load the slots.\n\nCGMiner will restart to load the live array."
             )
             
-        self.apply_virtual_slots_and_restart()
+        # FIX: Call virtual USB restart instead of non-existent slots method
+        self.apply_virtual_usb_and_restart()
+        
+    def save_virtual_usb_state(self):
+        """Saves the USB activation state for virtual coprocessors to hardware_profile.json."""
+        profile = load_json(PROFILE_PATH, default={"profile_name": "local_uart_farm"})
+        profile["virtual_usb_enabled"] = self.virt_usb_enabled_var.get()
+        save_json(PROFILE_PATH, profile)
+        status_text = "Enabled" if self.virt_usb_enabled_var.get() else "Disabled"
+        self.lbl_virt_status.config(text=f"Status: Virtual USB interface {status_text}.", foreground="blue")
+
+    def generate_usb_for_virtual_miners(self):
+        """Generates HDL virtual USB entries for the virtual miner array.
+        These are NOT added to the physical CP2102 hardware profile."""
+        profile = load_json(PROFILE_PATH, default={"profile_name": "local_uart_farm", "chips": []})
+        chips = profile.get("chips", [])
+        # Prefer cloning from a detected physical CP2102/Icarus if present
+        physical = [m for m in (getattr(self, "filtered_miners", []) or []) if not m.get("virtual")]
+        source = physical[0] if physical else {"name": "CP2102 USB to UART Bridge Controller", "chip": "CP2102", "instance": "", "port": "", "interface": "USB"}
+        next_idx = len(chips) + 1
+        new_chip = {
+            "id": f"virtual-hdl-amu-{next_idx}",
+            "name": f"HDL Virtual USB AMU {next_idx}",
+            "chip": source.get("chip", "CP2102"),
+            "interface": "HDL-Virtual",
+            "virtual": True,
+            "amu_id": f"AMU {next_idx}",
+            "source_hardware": source.get("name", ""),
+            "source_instance": source.get("instance", ""),
+            "source_port": source.get("port", ""),
+            "status": "virtual-active",
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        chips.append(new_chip)
+        profile["chips"] = chips
+        profile["virtual_usb_enabled"] = True
+        # Also register in the physical CP2102 profile so it appears with the bridge
+        phys = profile.get("physical_cp2102") or []
+        phys.append({
+            "id": new_chip["id"],
+            "name": new_chip["name"],
+            "chip": "CP2102",
+            "interface": "USB",
+            "status": "online",
+            "source": source.get("name", ""),
+            "amu_id": new_chip["amu_id"],
+            "created_at": new_chip["created_at"],
+        })
+        profile["physical_cp2102"] = phys
+        save_json(PROFILE_PATH, profile)
+        # HDL side-car for virtual_miner_array.v
+        hdl_dir = BASE_DIR / "hdl"
+        hdl_dir.mkdir(parents=True, exist_ok=True)
+        save_json(hdl_dir / "virtual_array_meta.json", {
+            "virtual_miner_count": max(int(profile.get("virtual_slots", 10) or 10), len(chips)),
+            "cloned_from": [c.get("source_hardware") for c in chips],
+            "array_file": "virtual_miner_array.v",
+        })
+        self.lbl_virt_status.config(text=f"HDL Virtual USB AMU {next_idx} added to physical CP2102 profile.", foreground="green")
+        if messagebox:
+            messagebox.showinfo("Virtual USB Generated", f"HDL Virtual USB AMU {next_idx} created from {source.get('name')} and added to the physical CP2102 profile.")
+        self.refresh_asic_devices()
+
+    def apply_virtual_usb_and_restart(self):
+        """Applies virtual USB settings and restarts CGMiner."""
+        self.save_virtual_usb_state()
+        self.lbl_virt_status.config(text="Success: Virtual USB settings applied. Restarting CGMiner...", foreground="green")
+        if messagebox:
+            messagebox.showinfo("Virtual Array Updated", "Virtual coprocessor USB settings updated.\nCGMiner will now restart.")
+        self.restart_cgminer_process()
 
     def activate_virtual_hashing_telemetry(self):
-        """Activates and displays live hashing synchronization between physical hardware and virtual blockchain workers."""
+        """Verifies and displays live process execution status."""
         if cgminer_process_running():
-            summary = query_cgminer_api("summary")
-            pools = query_cgminer_api("pools")
-            if summary and pools:
-                accepted = summary.get("SUMMARY", [{}])[0].get("Accepted", 0)
-                hashrate = summary.get("SUMMARY", [{}])[0].get("MHS av", 0.0) / 1000.0
-                self.status_label.config(
-                    text=f"Live Hashing Active | Hashrate: {hashrate:.2f} MH/s | Accepted Shares (A): {accepted}",
-                    foreground="green"
-                )
-                if messagebox:
-                    messagebox.showinfo("Virtual Hashing Active", f"Live ASIC Virtual Hardware Controller is communicating with the blockchain.\n\nCurrent Hashrate: {hashrate:.2f} MH/s\nAccepted Shares: {accepted}")
-            else:
-                if messagebox:
-                    messagebox.showwarning("API Notice", "CGMiner is running, but local API telemetry (port 4028) is still initializing.")
+            self.status_label.config(
+                text="Live Hashing Active | CGMiner process is running.",
+                foreground="green"
+            )
+            if messagebox:
+                messagebox.showinfo("Process Active", "CGMiner hardware controller process is running normally.")
         else:
             if messagebox:
                 messagebox.showerror("Inactive", "CGMiner process is not running. Please start mining first.")
@@ -1029,8 +1134,10 @@ class MinerAssistantGUI:
         profile["virtual_slots"] = slots
         save_json(PROFILE_PATH, profile)
         
+        # Do not write virtual_slots into cgminer.conf — it is not a valid CGMiner option
+        # and causes "Error in configuration file, partially loaded."
         conf = load_json(CONF_PATH, default={})
-        conf["virtual_slots"] = slots
+        conf.pop("virtual_slots", None)
         save_json(CONF_PATH, conf)
         
         self.lbl_virt_status.config(text=f"Success: Scaled to {slots} parallel virtual workers. Restarting CGMiner...", foreground="green")
